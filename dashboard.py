@@ -5,6 +5,8 @@ dashboard.py - Local web dashboard served on localhost:8080.
 import json
 import os
 import sqlite3
+import threading
+import time
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 from pathlib import Path
@@ -22,6 +24,41 @@ DB_PATH = Path(os.environ.get("CLAUDE_USAGE_DB", Path.home() / ".claude" / "usag
 # the version (VS Code updates the extension itself, and a GitHub-release check
 # would misfire there because the Marketplace publish lags the GitHub release).
 SURFACE = "web"
+
+# /api/data runs an incremental scan before reading the DB, so the browser's
+# 10s auto-refresh picks up usage from sessions that are still chatting —
+# without it, new transcript lines only land in the DB when the user presses
+# Rescan. Throttled so overlapping polls (multiple tabs, the VS Code panel)
+# don't stack scans, and lock-guarded because ThreadingHTTPServer handles
+# requests concurrently.
+# Must stay below the browser's poll interval (2s), or every other poll
+# would skip its scan.
+SCAN_MIN_INTERVAL = 1.5  # seconds between /api/data-triggered scans
+_scan_lock = threading.Lock()
+_last_scan_at = 0.0
+
+
+def _scan_if_stale():
+    global _last_scan_at
+    if time.monotonic() - _last_scan_at < SCAN_MIN_INTERVAL:
+        return
+    if not _scan_lock.acquire(blocking=False):
+        return  # another request thread is already scanning
+    try:
+        _last_scan_at = time.monotonic()
+        # Import here and pass globals explicitly — same contract as
+        # /api/rescan, so tests that patch DB_PATH / DEFAULT_PROJECTS_DIRS
+        # are honored.
+        import scanner
+        scanner.scan(
+            db_path=DB_PATH,
+            projects_dirs=scanner.DEFAULT_PROJECTS_DIRS,
+            verbose=False,
+        )
+    except Exception:
+        pass  # serve the existing data; the next poll retries the scan
+    finally:
+        _scan_lock.release()
 
 
 def get_dashboard_data(db_path=DB_PATH):
@@ -254,6 +291,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     --raised: #2E2F31;  /* hover / raised surfaces — top of the elevation ladder */
     --selected: #262626;  /* selected chips / tabs (neutral, not accent) */
     --jump-h: 45px;  /* sticky jump-bar height; JS keeps it in sync for scroll offsets */
+    --radius-md: 3px;   /* cards / panels — sharp, ledger-like rather than soft SaaS rounding */
+    --radius-sm: 2px;   /* buttons / chips / inputs */
+    --font-mono: ui-monospace, 'Cascadia Code', 'SF Mono', Consolas, monospace;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 14px; }
@@ -271,7 +311,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   ::-webkit-scrollbar-corner { background: #121314; }
 
   header { background: var(--card); border-bottom: 1px solid var(--border); padding: 16px 24px; display: flex; align-items: center; justify-content: space-between; }
-  header h1 { font-size: 18px; font-weight: 600; color: var(--text); }
+  /* tabular-nums keeps digit widths fixed so the count-up animation doesn't
+     make the title jitter horizontally. */
+  header h1 { font-size: 18px; font-weight: 600; color: var(--text); font-variant-numeric: tabular-nums; }
   header .header-title { display: flex; align-items: center; gap: 10px; }
   /* The icon is a monochrome silhouette (white shape on transparent). We paint
      it with the title color via a CSS mask + background-color, so it matches
@@ -283,7 +325,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     mask: url("icon.svg") no-repeat center / contain;
   }
   header .meta { color: var(--muted); font-size: 12px; text-align: right; line-height: 1.5; margin-right: 20px; }
-  #rescan-btn { background: var(--card); border: 1px solid var(--border); color: var(--muted); padding: 4px 12px; border-radius: 6px; cursor: pointer; font-size: 12px; margin-top: 4px; }
+  #rescan-btn { background: var(--card); border: 1px solid var(--border); color: var(--muted); padding: 4px 12px; border-radius: var(--radius-sm); cursor: pointer; font-size: 12px; margin-top: 4px; }
   #rescan-btn:hover { color: var(--text); border-color: var(--accent); }
   #rescan-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
@@ -292,38 +334,43 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .filter-sep { width: 1px; height: 22px; background: var(--border); flex-shrink: 0; }
   /* Model multi-select: a compact trigger in the bar that opens a grouped panel. */
   .model-select { position: relative; flex-shrink: 0; }
-  .model-trigger { display: flex; align-items: center; gap: 8px; min-width: 170px; max-width: 320px; padding: 5px 10px; background: var(--card); border: 1px solid var(--border); border-radius: 6px; color: var(--text); font-size: 12px; cursor: pointer; transition: border-color 0.15s; }
+  .model-trigger { display: flex; align-items: center; gap: 8px; min-width: 170px; max-width: 320px; padding: 5px 10px; background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--text); font-size: 12px; cursor: pointer; transition: border-color 0.15s; }
   .model-trigger:hover, .model-trigger.open { border-color: var(--accent); }
   #model-trigger-label { flex: 1; text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .model-caret { color: var(--muted); font-size: 10px; flex-shrink: 0; transition: transform 0.15s; }
   .model-trigger.open .model-caret { transform: rotate(180deg); }
-  .model-panel { position: absolute; top: calc(100% + 6px); left: 0; z-index: 50; min-width: 250px; max-width: 340px; max-height: 360px; overflow-y: auto; background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 8px; box-shadow: 0 8px 24px rgba(0,0,0,0.35); }
+  .model-panel { position: absolute; top: calc(100% + 6px); left: 0; z-index: 50; min-width: 250px; max-width: 340px; max-height: 360px; overflow-y: auto; background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 8px; box-shadow: 0 8px 24px rgba(0,0,0,0.35); }
   .model-panel[hidden] { display: none; }
   .model-panel-actions { display: flex; gap: 6px; padding-bottom: 8px; margin-bottom: 4px; border-bottom: 1px solid var(--border); }
   .model-group-label { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); padding: 8px 8px 4px; }
-  .model-cb-label { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 6px; cursor: pointer; font-size: 12px; color: var(--muted); transition: background 0.12s, color 0.12s; user-select: none; }
+  .model-cb-label { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: var(--radius-sm); cursor: pointer; font-size: 12px; color: var(--muted); transition: background 0.12s, color 0.12s; user-select: none; }
   .model-cb-label:hover { background: var(--raised); color: var(--text); }
   .model-cb-label.checked { color: var(--text); }
   .model-cb-label input { display: none; }
-  .model-cb-box { width: 15px; height: 15px; flex-shrink: 0; border-radius: 4px; border: 1px solid var(--border); display: flex; align-items: center; justify-content: center; font-size: 10px; line-height: 1; color: transparent; transition: background 0.12s, border-color 0.12s; }
+  .model-cb-box { width: 15px; height: 15px; flex-shrink: 0; border-radius: var(--radius-sm); border: 1px solid var(--border); display: flex; align-items: center; justify-content: center; font-size: 10px; line-height: 1; color: transparent; transition: background 0.12s, border-color 0.12s; }
   .model-cb-label.checked .model-cb-box { background: var(--accent); border-color: var(--accent); color: #fff; }
   .model-cb-text { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .filter-btn { padding: 3px 10px; border-radius: 4px; border: 1px solid var(--border); background: transparent; color: var(--muted); font-size: 11px; cursor: pointer; white-space: nowrap; }
+  .filter-btn { padding: 3px 10px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: transparent; color: var(--muted); font-size: 11px; cursor: pointer; white-space: nowrap; }
   .filter-btn:hover { border-color: var(--accent); color: var(--text); }
   /* Date range — a compact dropdown. The old segmented button row (8 buttons)
      wrapped badly in the narrow VS Code panel; a single select stays put. Styled
      to match the model trigger. */
   .range-select { position: relative; flex-shrink: 0; }
-  .range-select select { appearance: none; -webkit-appearance: none; min-width: 150px; padding: 5px 30px 5px 10px; background: var(--card); border: 1px solid var(--border); border-radius: 6px; color: var(--text); font-size: 12px; cursor: pointer; transition: border-color 0.15s; }
+  .range-select select { appearance: none; -webkit-appearance: none; min-width: 150px; padding: 5px 30px 5px 10px; background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--text); font-size: 12px; cursor: pointer; transition: border-color 0.15s; }
   .range-select select:hover, .range-select select:focus { border-color: var(--accent); outline: none; }
   .range-select::after { content: "\25BE"; position: absolute; right: 11px; top: 50%; transform: translateY(-50%); color: var(--muted); font-size: 10px; pointer-events: none; }
   .range-select option { background: var(--card); color: var(--text); }
 
   .container { max-width: 1400px; margin: 0 auto; padding: 24px; }
-  .stats-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 16px; margin-bottom: 24px; }
-  .stat-card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+  /* Ledger strip, not a row of separate rounded cards: the 1px grid gap over a
+     --border-colored background draws quiet hairline rules between metrics in
+     both directions, and keeps working automatically when auto-fit wraps to a
+     second row — a set of per-card borders can't do that without knowing the
+     row count in advance. */
+  .stats-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 1px; background: var(--border); border: 1px solid var(--border); border-radius: var(--radius-md); overflow: hidden; margin-bottom: 24px; }
+  .stat-card { background: var(--card); padding: 16px 20px; }
   .stat-card .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 6px; }
-  .stat-card .value { font-size: 22px; font-weight: 700; }
+  .stat-card .value { font-size: 22px; font-weight: 700; font-family: var(--font-mono); letter-spacing: -0.02em; }
   .stat-card .sub { color: var(--muted); font-size: 11px; margin-top: 4px; }
 
   .charts-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 24px; }
@@ -331,7 +378,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
      pixel width; without it, narrowing the window can't narrow the container,
      so Chart.js's ResizeObserver never fires until a data refresh rebuilds the
      canvas. (Expanding already works — 1fr columns grow freely.) */
-  .chart-card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 20px; min-width: 0; }
+  .chart-card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 20px; min-width: 0; }
   .chart-card.wide { grid-column: 1 / -1; }
   .chart-card h2 { font-size: 13px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 16px; }
   .chart-wrap { position: relative; height: 240px; }
@@ -340,7 +387,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .chart-header h2 { margin-bottom: 0; }
   .chart-header-right { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
   .chart-day-count { font-size: 11px; color: var(--muted); }
-  .tz-group { display: flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+  .tz-group { display: flex; border: 1px solid var(--border); border-radius: var(--radius-sm); overflow: hidden; }
   .tz-btn { padding: 3px 10px; background: transparent; border: none; border-right: 1px solid var(--border); color: var(--muted); font-size: 11px; cursor: pointer; transition: background 0.15s, color 0.15s; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; }
   .tz-btn:last-child { border-right: none; }
   .tz-btn:hover { background: var(--raised); color: var(--text); }
@@ -356,22 +403,22 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   td { padding: 10px 12px; border-bottom: 1px solid var(--border); font-size: 13px; }
   tr:last-child td { border-bottom: none; }
   tr:hover td { background: var(--raised); }
-  .model-tag { display: inline-block; padding: 2px 7px; border-radius: 4px; font-size: 11px; background: rgba(72,160,199,0.15); color: var(--blue); }
-  .cost { color: var(--green); font-family: monospace; }
-  .cost-na { color: var(--muted); font-family: monospace; font-size: 11px; }
-  .num { font-family: monospace; }
+  .model-tag { display: inline-block; padding: 2px 7px; border-radius: var(--radius-sm); font-size: 11px; background: rgba(72,160,199,0.15); color: var(--blue); }
+  .cost { color: var(--green); font-family: var(--font-mono); }
+  .cost-na { color: var(--muted); font-family: var(--font-mono); font-size: 11px; }
+  .num { font-family: var(--font-mono); }
   .muted { color: var(--muted); }
   .topic-cell { box-sizing: border-box; min-width: 160px; max-width: 260px; overflow-wrap: anywhere; font-size: 12px; color: var(--text); }
   .untitled { color: var(--muted); font-style: italic; }
   .section-title { font-size: 13px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 12px; }
   .section-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
   .section-header .section-title { margin-bottom: 0; }
-  .export-btn { background: var(--card); border: 1px solid var(--border); color: var(--muted); padding: 3px 10px; border-radius: 5px; cursor: pointer; font-size: 11px; }
+  .export-btn { background: var(--card); border: 1px solid var(--border); color: var(--muted); padding: 3px 10px; border-radius: var(--radius-sm); cursor: pointer; font-size: 11px; }
   .export-btn:hover { color: var(--text); border-color: var(--accent); }
-  .table-card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin-bottom: 24px; overflow-x: auto; }
+  .table-card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 20px; margin-bottom: 24px; overflow-x: auto; }
   .table-foot { display: flex; justify-content: flex-end; align-items: center; gap: 12px; margin-top: 12px; }
   .table-foot:empty { margin-top: 0; }
-  .show-more-btn { background: transparent; border: 1px solid var(--border); color: var(--muted); padding: 4px 12px; border-radius: 6px; cursor: pointer; font-size: 12px; }
+  .show-more-btn { background: transparent; border: 1px solid var(--border); color: var(--muted); padding: 4px 12px; border-radius: var(--radius-sm); cursor: pointer; font-size: 12px; }
   .show-more-btn:hover { color: var(--text); border-color: var(--accent); }
   .show-more-link { color: var(--blue); text-decoration: none; font-size: 12px; cursor: pointer; }
   .show-more-link:hover { text-decoration: underline; }
@@ -394,18 +441,18 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
      (or keyboard focus). Stays small so it never crowds the narrow VS Code panel. */
   #jump-bar { position: sticky; top: 0; z-index: 20; background: var(--card); border-bottom: 1px solid var(--border); padding: 7px 24px; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; box-shadow: 0 2px 8px rgba(0,0,0,0.18); }
   .jump-menu { position: relative; }
-  .jump-trigger { display: inline-flex; align-items: center; gap: 6px; padding: 3px 11px; border-radius: 6px; border: 1px solid transparent; background: transparent; color: var(--muted); font-size: 12px; cursor: pointer; transition: background 0.12s, color 0.12s, border-color 0.12s; }
+  .jump-trigger { display: inline-flex; align-items: center; gap: 6px; padding: 3px 11px; border-radius: var(--radius-sm); border: 1px solid transparent; background: transparent; color: var(--muted); font-size: 12px; cursor: pointer; transition: background 0.12s, color 0.12s, border-color 0.12s; }
   .jump-trigger svg { display: block; }
   .jump-caret { font-size: 9px; }
   .jump-trigger:hover, .jump-menu:focus-within .jump-trigger { color: var(--text); background: var(--raised); }
   .jump-trigger.active { color: var(--text); border-color: var(--border); }
-  .jump-panel { position: absolute; top: calc(100% + 5px); left: 0; z-index: 50; min-width: 160px; display: none; flex-direction: column; gap: 2px; padding: 6px; background: var(--card); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,0.35); }
+  .jump-panel { position: absolute; top: calc(100% + 5px); left: 0; z-index: 50; min-width: 160px; display: none; flex-direction: column; gap: 2px; padding: 6px; background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-md); box-shadow: 0 8px 24px rgba(0,0,0,0.35); }
   /* Invisible bridge over the 5px gap so the menu doesn't close as the pointer
      travels from the trigger down to the panel. */
   .jump-panel::before { content: ""; position: absolute; left: 0; right: 0; top: -8px; height: 8px; }
   .jump-menu-end .jump-panel { left: auto; right: 0; }
   .jump-menu:hover .jump-panel, .jump-menu:focus-within .jump-panel { display: flex; }
-  .jump-link { padding: 3px 11px; border-radius: 6px; border: 1px solid transparent; background: transparent; color: var(--muted); font-size: 12px; cursor: pointer; white-space: nowrap; transition: background 0.12s, color 0.12s, border-color 0.12s; }
+  .jump-link { padding: 3px 11px; border-radius: var(--radius-sm); border: 1px solid transparent; background: transparent; color: var(--muted); font-size: 12px; cursor: pointer; white-space: nowrap; transition: background 0.12s, color 0.12s, border-color 0.12s; }
   .jump-panel .jump-link { display: block; width: 100%; text-align: left; padding: 5px 10px; }
   .jump-link:hover { color: var(--text); background: var(--raised); }
   .jump-link.active { color: var(--text); background: var(--selected); border-color: var(--border); font-weight: 600; }
@@ -433,13 +480,17 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .table-card.collapsed .section-header > *:not(.section-title) { display: none; }
 
   @media (max-width: 768px) { .charts-grid { grid-template-columns: 1fr; } .chart-card.wide { grid-column: 1; } }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { transition-duration: 0.001ms !important; animation-duration: 0.001ms !important; }
+  }
 </style>
 </head>
 <body>
 <header>
   <div class="header-title">
     <span class="header-icon" role="img" aria-label="Claude Usage"></span>
-    <h1>Claude Code Usage</h1>
+    <h1 id="header-title">Claude Code Usage</h1>
   </div>
   <div class="meta" id="meta">Loading...</div>
   <button id="rescan-btn" onclick="triggerRescan()" title="Scan for new usage since the last update. Adds new turns without affecting existing history.">&#x21bb; Rescan</button>
@@ -621,7 +672,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
 <footer>
   <div class="footer-content">
-    <p>Cost estimates based on Anthropic API pricing (<a href="https://claude.com/pricing#api" target="_blank">claude.com/pricing#api</a>) as of June 2026. Only models containing <em>fable</em>, <em>mythos</em>, <em>opus</em>, <em>sonnet</em>, or <em>haiku</em> in the name are included in cost calculations. Actual costs for Max/Pro subscribers differ from API pricing.</p>
+    <p>Cost estimates based on Anthropic API pricing (<a href="https://claude.com/pricing#api" target="_blank">claude.com/pricing#api</a>) as of June 2026. Sonnet 5 usage dated on or before 2026-08-31 is priced at its introductory rate ($2/$10 per MTok); later usage at the standard rate ($3/$15). Only models containing <em>fable</em>, <em>mythos</em>, <em>opus</em>, <em>sonnet</em>, or <em>haiku</em> in the name are included in cost calculations. Actual costs for Max/Pro subscribers differ from API pricing.</p>
     <p>
       GitHub: <a href="https://github.com/phuryn/claude-usage" target="_blank">https://github.com/phuryn/claude-usage</a>
       &nbsp;&middot;&nbsp;
@@ -741,6 +792,7 @@ const PRICING = {
   'claude-opus-4-7':   { input:  5.00, output: 25.00, cache_write:  6.25, cache_read: 0.50 },
   'claude-opus-4-6':   { input:  5.00, output: 25.00, cache_write:  6.25, cache_read: 0.50 },
   'claude-opus-4-5':   { input:  5.00, output: 25.00, cache_write:  6.25, cache_read: 0.50 },
+  'claude-sonnet-5':   { input:  3.00, output: 15.00, cache_write:  3.75, cache_read: 0.30 },
   'claude-sonnet-4-7': { input:  3.00, output: 15.00, cache_write:  3.75, cache_read: 0.30 },
   'claude-sonnet-4-6': { input:  3.00, output: 15.00, cache_write:  3.75, cache_read: 0.30 },
   'claude-sonnet-4-5': { input:  3.00, output: 15.00, cache_write:  3.75, cache_read: 0.30 },
@@ -756,23 +808,46 @@ function isBillable(model) {
          m.includes('opus') || m.includes('sonnet') || m.includes('haiku');
 }
 
-function getPricing(model) {
+// Introductory launch pricing, applied by usage date. PRICING above holds the
+// standard (post-promo) rates (and stays in the exact format the pricing-parity
+// test parses); getPricing swaps in the promo rates when a row's date falls
+// inside the window. Rows without a date price as of today.
+const INTRO_PRICING = {
+  // Sonnet 5 launch discount ($2/$10) through 2026-08-31; standard $3/$15 after.
+  // (The parity-test regex needs `input:` directly after a 'claude-…' key, so
+  // `until:` coming first keeps this entry invisible to it.)
+  'claude-sonnet-5': { until: '2026-08-31', rates: { input: 2.00, output: 10.00, cache_write: 2.50, cache_read: 0.20 } },
+};
+
+function resolvePricingKey(model) {
   if (!model) return null;
-  if (PRICING[model]) return PRICING[model];
+  if (PRICING[model]) return model;
   for (const key of Object.keys(PRICING)) {
-    if (model.startsWith(key)) return PRICING[key];
+    if (model.startsWith(key)) return key;
   }
   const m = model.toLowerCase();
-  if (m.includes('fable') || m.includes('mythos')) return PRICING['claude-fable-5'];
-  if (m.includes('opus'))   return PRICING['claude-opus-4-8'];
-  if (m.includes('sonnet')) return PRICING['claude-sonnet-4-6'];
-  if (m.includes('haiku'))  return PRICING['claude-haiku-4-5'];
+  if (m.includes('fable') || m.includes('mythos')) return 'claude-fable-5';
+  if (m.includes('opus'))   return 'claude-opus-4-8';
+  if (m.includes('sonnet')) return 'claude-sonnet-4-6';
+  if (m.includes('haiku'))  return 'claude-haiku-4-5';
   return null;
 }
 
-function calcCost(model, inp, out, cacheRead, cacheCreation) {
+// date is 'YYYY-MM-DD' or a full ISO timestamp (only the date part is used).
+function getPricing(model, date) {
+  const key = resolvePricingKey(model);
+  if (!key) return null;
+  const intro = INTRO_PRICING[key];
+  if (intro) {
+    const day = (date || new Date().toISOString()).slice(0, 10);
+    if (day <= intro.until) return intro.rates;
+  }
+  return PRICING[key];
+}
+
+function calcCost(model, inp, out, cacheRead, cacheCreation, date) {
   if (!isBillable(model)) return 0;
-  const p = getPricing(model);
+  const p = getPricing(model, date);
   if (!p) return 0;
   return (
     inp           * p.input       / 1e6 +
@@ -853,6 +928,10 @@ function fmtDuration(ms) {
 // bordered box that looked offset/inconsistent). Lines use their solid stroke
 // color instead of the translucent area fill.
 Chart.defaults.color = C.axis;
+// No draw-in animation: charts are destroyed and rebuilt on every data change,
+// so the bar-grow/donut-sweep replay on each refresh reads as flicker rather
+// than polish. Render instantly instead.
+Chart.defaults.animation = false;
 // multiKeyBackground defaults to white and is drawn behind each tooltip swatch,
 // peeking out as a thin white border on plain-box charts — make it transparent.
 Chart.defaults.plugins.tooltip.multiKeyBackground = 'transparent';
@@ -1149,8 +1228,8 @@ function sortSessions(sessions) {
   return [...sessions].sort((a, b) => {
     let av, bv;
     if (sessionSortCol === 'cost') {
-      av = calcCost(a.model, a.input, a.output, a.cache_read, a.cache_creation);
-      bv = calcCost(b.model, b.input, b.output, b.cache_read, b.cache_creation);
+      av = calcCost(a.model, a.input, a.output, a.cache_read, a.cache_creation, a.last_date);
+      bv = calcCost(b.model, b.input, b.output, b.cache_read, b.cache_creation, b.last_date);
     } else if (sessionSortCol === 'duration_min') {
       av = parseFloat(a.duration_min) || 0;
       bv = parseFloat(b.duration_min) || 0;
@@ -1184,20 +1263,24 @@ function applyFilter() {
     d.output         += r.output;
     d.cache_read     += r.cache_read;
     d.cache_creation += r.cache_creation;
-    d.cost           += calcCost(r.model, r.input, r.output, r.cache_read, r.cache_creation);
+    d.cost           += calcCost(r.model, r.input, r.output, r.cache_read, r.cache_creation, r.day);
   }
   const daily = Object.values(dailyMap).sort((a, b) => a.day.localeCompare(b.day));
 
-  // By model: aggregate tokens + turns from daily data
+  // By model: aggregate tokens + turns from daily data. Cost accumulates here
+  // per dated row (not on the aggregate later) because pricing can change with
+  // the date — e.g. Sonnet 5's intro window — so a range spanning the boundary
+  // must price each day at its own rate.
   const modelMap = {};
   for (const r of filteredDaily) {
-    if (!modelMap[r.model]) modelMap[r.model] = { model: r.model, input: 0, output: 0, cache_read: 0, cache_creation: 0, turns: 0, sessions: 0 };
+    if (!modelMap[r.model]) modelMap[r.model] = { model: r.model, input: 0, output: 0, cache_read: 0, cache_creation: 0, turns: 0, sessions: 0, cost: 0 };
     const m = modelMap[r.model];
     m.input          += r.input;
     m.output         += r.output;
     m.cache_read     += r.cache_read;
     m.cache_creation += r.cache_creation;
     m.turns          += r.turns;
+    m.cost           += calcCost(r.model, r.input, r.output, r.cache_read, r.cache_creation, r.day);
   }
 
   // Filter sessions by model + date range
@@ -1223,7 +1306,7 @@ function applyFilter() {
     p.cache_creation += s.cache_creation;
     p.turns          += s.turns;
     p.sessions++;
-    p.cost += calcCost(s.model, s.input, s.output, s.cache_read, s.cache_creation);
+    p.cost += calcCost(s.model, s.input, s.output, s.cache_read, s.cache_creation, s.last_date);
   }
   const byProject = Object.values(projMap).sort((a, b) => (b.input + b.output) - (a.input + a.output));
 
@@ -1239,7 +1322,7 @@ function applyFilter() {
     pb.cache_creation += s.cache_creation;
     pb.turns          += s.turns;
     pb.sessions++;
-    pb.cost += calcCost(s.model, s.input, s.output, s.cache_read, s.cache_creation);
+    pb.cost += calcCost(s.model, s.input, s.output, s.cache_read, s.cache_creation, s.last_date);
   }
   const byProjectBranch = Object.values(projBranchMap).sort((a, b) => b.cost - a.cost);
 
@@ -1251,7 +1334,7 @@ function applyFilter() {
     output:         byModel.reduce((s, m) => s + m.output, 0),
     cache_read:     byModel.reduce((s, m) => s + m.cache_read, 0),
     cache_creation: byModel.reduce((s, m) => s + m.cache_creation, 0),
-    cost:           byModel.reduce((s, m) => s + calcCost(m.model, m.input, m.output, m.cache_read, m.cache_creation), 0),
+    cost:           byModel.reduce((s, m) => s + m.cost, 0),
     subagent_tokens: (rawData.subagent_by_type || [])
       .filter(r => selectedModels.has(r.model) && (!start || r.day >= start) && (!end || r.day <= end))
       .reduce((s, r) => s + r.input + r.output + r.cache_read + r.cache_creation, 0),
@@ -1311,25 +1394,87 @@ function applyFilter() {
 }
 
 // ── Renderers ──────────────────────────────────────────────────────────────
+// Animated count-up for stat values (Ant Design Statistic-style, no library):
+// numbers ease from the previously shown value to the new one over ~2s.
+// Skipped on first paint (nothing to count from), when the value is unchanged,
+// and under prefers-reduced-motion. Values are set via textContent each frame,
+// so no escaping is needed. A repaint mid-animation is safe: renderStats
+// replaces the elements, and the orphaned tick loop stops on !el.isConnected.
+const statPrev = {};
+const REDUCED_MOTION = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+function animateValue(el, from, to, format, duration = 2000) {
+  if (from == null) from = 0;  // first appearance counts up from zero
+  if (REDUCED_MOTION || from === to) { el.textContent = format(to); return; }
+  const start = performance.now();
+  (function tick(now) {
+    const t = Math.min((now - start) / duration, 1);
+    const eased = 1 - Math.pow(1 - t, 3);  // easeOutCubic
+    el.textContent = format(from + (to - from) * eased);
+    if (t < 1 && el.isConnected) requestAnimationFrame(tick);
+  })(start);
+}
+
+// ── Animated numbers in tables ──────────────────────────────────────────────
+// Same count-up for table cells. Cells render as placeholder spans carrying
+// their raw value; runCellAnims() then tweens each from the value it last
+// showed (keyed per row+column, so sorting/paging doesn't re-animate unchanged
+// numbers, while a row's first appearance counts up from 0). Keys are
+// URI-encoded into the attribute so arbitrary project/branch names are safe.
+const cellPrev = new Map();
+const ANIM_FMTS = {
+  tok:  v => fmt(Math.round(v)),
+  int:  v => Math.round(v).toLocaleString(),
+  cost: v => fmtCost(v),
+};
+
+function animNum(key, raw, fmtName) {
+  return `<span class="anim-num" data-k="${encodeURIComponent(key)}" data-v="${raw}" data-f="${fmtName}"></span>`;
+}
+
+function runCellAnims(bodyId) {
+  document.getElementById(bodyId).querySelectorAll('.anim-num').forEach(el => {
+    const key = decodeURIComponent(el.dataset.k);
+    const to = parseFloat(el.dataset.v) || 0;
+    animateValue(el, cellPrev.get(key), to, ANIM_FMTS[el.dataset.f]);
+    cellPrev.set(key, to);
+  });
+}
+
 function renderStats(t) {
   const rangeLabel = RANGE_LABELS[selectedRange].toLowerCase();
+  // Intermediate tween values are floats — round before the integer formats.
+  const intFmt = v => Math.round(v).toLocaleString();
+  const tokFmt = v => fmt(Math.round(v));
   const stats = [
-    { label: 'Sessions',       value: t.sessions.toLocaleString(), sub: rangeLabel },
-    { label: 'Turns',          value: fmt(t.turns),                sub: rangeLabel },
-    { label: 'Input Tokens',   value: fmt(t.input),                sub: rangeLabel },
-    { label: 'Output Tokens',  value: fmt(t.output),               sub: rangeLabel },
-    { label: 'Subagent Tokens', value: fmt(t.subagent_tokens || 0), sub: 'included in totals' },
-    { label: 'Cache Read',     value: fmt(t.cache_read),           sub: 'from prompt cache' },
-    { label: 'Cache Creation', value: fmt(t.cache_creation),       sub: 'writes to prompt cache' },
-    { label: 'Est. Cost',      value: fmtCostBig(t.cost),          sub: 'API pricing, June 2026', color: C.green },
+    { label: 'Sessions',        raw: t.sessions,             format: intFmt,     sub: rangeLabel },
+    { label: 'Turns',           raw: t.turns,                format: tokFmt,     sub: rangeLabel },
+    { label: 'Input Tokens',    raw: t.input,                format: tokFmt,     sub: rangeLabel },
+    { label: 'Output Tokens',   raw: t.output,               format: tokFmt,     sub: rangeLabel },
+    { label: 'Subagent Tokens', raw: t.subagent_tokens || 0, format: tokFmt,     sub: 'included in totals' },
+    { label: 'Cache Read',      raw: t.cache_read,           format: tokFmt,     sub: 'from prompt cache' },
+    { label: 'Cache Creation',  raw: t.cache_creation,       format: tokFmt,     sub: 'writes to prompt cache' },
+    { label: 'Est. Cost',       raw: t.cost,                 format: fmtCostBig, sub: 'API pricing, June 2026', color: C.green },
   ];
-  document.getElementById('stats-row').innerHTML = stats.map(s => `
+  document.getElementById('stats-row').innerHTML = stats.map((s, i) => `
     <div class="stat-card">
       <div class="label">${s.label}</div>
-      <div class="value" style="${s.color ? 'color:' + s.color : ''}">${esc(s.value)}</div>
+      <div class="value" id="stat-val-${i}" style="${s.color ? 'color:' + s.color : ''}"></div>
       ${s.sub ? `<div class="sub">${esc(s.sub)}</div>` : ''}
     </div>
   `).join('');
+  stats.forEach((s, i) => {
+    animateValue(document.getElementById('stat-val-' + i), statPrev[s.label], s.raw, s.format);
+    statPrev[s.label] = s.raw;
+  });
+
+  // Header shows the filtered range's Est. Cost instead of the static app
+  // name, counting up with the stat cards; the tab title jumps straight to
+  // the final value (per-frame tab-title updates read as flicker).
+  const costTitleFmt = v => 'Est. Cost: ' + fmtCostBig(v) + ' (' + rangeLabel + ')';
+  animateValue(document.getElementById('header-title'), statPrev['__header_cost'], t.cost, costTitleFmt);
+  statPrev['__header_cost'] = t.cost;
+  document.title = costTitleFmt(t.cost) + ' — Claude Code Usage';
 }
 
 // Bucket rows into 24 hours (display-TZ), summing turns + output, and count
@@ -1582,9 +1727,10 @@ function renderTopDispatches(rows) {
   const shown = rows.slice(0, shownCount(dispatchesLimit, rows.length));
   body.innerHTML = shown.map(d => {
     const tokensTotal = d.input + d.output + d.cache_read + d.cache_creation;
-    const cost = calcCost(d.model, d.input, d.output, d.cache_read, d.cache_creation);
+    const cost = calcCost(d.model, d.input, d.output, d.cache_read, d.cache_creation, d.start);
+    const k = 'd|' + (d.agent_id || d.agent_type + '|' + (d.start || '')) + '|';
     const costCell = isBillable(d.model)
-      ? `<td class="cost">${fmtCost(cost)}</td>`
+      ? `<td class="cost">${animNum(k + 'cost', cost, 'cost')}</td>`
       : `<td class="cost-na">n/a</td>`;
     const col = colorForAgentType(d.agent_type);
     const typeStyle = `background:${col}22;color:${col};border:1px solid ${col}44`;
@@ -1592,16 +1738,17 @@ function renderTopDispatches(rows) {
       <td><span class="model-tag" style="${typeStyle}">${esc(d.agent_type)}</span></td>
       <td class="muted">${esc(d.start || '—')}</td>
       <td><span class="model-tag">${esc(d.model)}</span></td>
-      <td class="num">${d.turns}</td>
-      <td class="num">${d.tool_uses != null ? d.tool_uses : '—'}</td>
+      <td class="num">${animNum(k + 'turns', d.turns, 'int')}</td>
+      <td class="num">${d.tool_uses != null ? animNum(k + 'tools', d.tool_uses, 'int') : '—'}</td>
       <td class="muted">${fmtDuration(d.duration_ms)}</td>
-      <td class="num">${fmt(d.input)}</td>
-      <td class="num">${fmt(d.output)}</td>
-      <td class="num">${fmt(d.cache_read)}</td>
-      <td class="num"><strong>${fmt(tokensTotal)}</strong></td>
+      <td class="num">${animNum(k + 'input', d.input, 'tok')}</td>
+      <td class="num">${animNum(k + 'output', d.output, 'tok')}</td>
+      <td class="num">${animNum(k + 'cr', d.cache_read, 'tok')}</td>
+      <td class="num"><strong>${animNum(k + 'total', tokensTotal, 'tok')}</strong></td>
       ${costCell}
     </tr>`;
   }).join('');
+  runCellAnims('dispatches-body');
   renderTableToggle('dispatches-foot', rows.length, dispatchesLimit, 'lessDispatchRows', 'moreDispatchRows', 'exportDispatchesCSV');
 }
 
@@ -1653,9 +1800,10 @@ function lessDispatchRows(){ dispatchesLimit = TABLE_STEPS[0]; renderTopDispatch
 function renderSessionsTable(sessions) {
   const shown = sessions.slice(0, shownCount(sessionsLimit, sessions.length));
   document.getElementById('sessions-body').innerHTML = shown.map(s => {
-    const cost = calcCost(s.model, s.input, s.output, s.cache_read, s.cache_creation);
+    const cost = calcCost(s.model, s.input, s.output, s.cache_read, s.cache_creation, s.last_date);
+    const k = 's|' + s.session_id + '|';
     const costCell = isBillable(s.model)
-      ? `<td class="cost">${fmtCost(cost)}</td>`
+      ? `<td class="cost">${animNum(k + 'cost', cost, 'cost')}</td>`
       : `<td class="cost-na">n/a</td>`;
     const titleCell = s.topic
       ? `<td class="topic-cell" title="${esc(s.topic)}">${esc(s.topic)}</td>`
@@ -1667,12 +1815,13 @@ function renderSessionsTable(sessions) {
       <td class="muted">${esc(s.last)}</td>
       <td class="muted">${esc(s.duration_min)}m</td>
       <td><span class="model-tag">${esc(s.model)}</span></td>
-      <td class="num">${s.turns}</td>
-      <td class="num">${fmt(s.input)}</td>
-      <td class="num">${fmt(s.output)}</td>
+      <td class="num">${animNum(k + 'turns', s.turns, 'int')}</td>
+      <td class="num">${animNum(k + 'input', s.input, 'tok')}</td>
+      <td class="num">${animNum(k + 'output', s.output, 'tok')}</td>
       ${costCell}
     </tr>`;
   }).join('');
+  runCellAnims('sessions-body');
   renderTableToggle('sessions-foot', sessions.length, sessionsLimit, 'lessSessionRows', 'moreSessionRows', 'exportSessionsCSV');
 }
 
@@ -1697,8 +1846,8 @@ function sortModels(byModel) {
   return [...byModel].sort((a, b) => {
     let av, bv;
     if (modelSortCol === 'cost') {
-      av = calcCost(a.model, a.input, a.output, a.cache_read, a.cache_creation);
-      bv = calcCost(b.model, b.input, b.output, b.cache_read, b.cache_creation);
+      av = a.cost;
+      bv = b.cost;
     } else {
       av = a[modelSortCol] ?? 0;
       bv = b[modelSortCol] ?? 0;
@@ -1713,20 +1862,21 @@ function renderModelCostTable(byModel) {
   const sorted = sortModels(byModel);
   const shown = sorted.slice(0, shownCount(modelLimit, sorted.length));
   document.getElementById('model-cost-body').innerHTML = shown.map(m => {
-    const cost = calcCost(m.model, m.input, m.output, m.cache_read, m.cache_creation);
+    const k = 'm|' + m.model + '|';
     const costCell = isBillable(m.model)
-      ? `<td class="cost">${fmtCost(cost)}</td>`
+      ? `<td class="cost">${animNum(k + 'cost', m.cost, 'cost')}</td>`
       : `<td class="cost-na">n/a</td>`;
     return `<tr>
       <td><span class="model-tag">${esc(m.model)}</span></td>
-      <td class="num">${fmt(m.turns)}</td>
-      <td class="num">${fmt(m.input)}</td>
-      <td class="num">${fmt(m.output)}</td>
-      <td class="num">${fmt(m.cache_read)}</td>
-      <td class="num">${fmt(m.cache_creation)}</td>
+      <td class="num">${animNum(k + 'turns', m.turns, 'tok')}</td>
+      <td class="num">${animNum(k + 'input', m.input, 'tok')}</td>
+      <td class="num">${animNum(k + 'output', m.output, 'tok')}</td>
+      <td class="num">${animNum(k + 'cr', m.cache_read, 'tok')}</td>
+      <td class="num">${animNum(k + 'cc', m.cache_creation, 'tok')}</td>
       ${costCell}
     </tr>`;
   }).join('');
+  runCellAnims('model-cost-body');
   renderTableToggle('model-cost-foot', sorted.length, modelLimit, 'lessModelRows', 'moreModelRows', 'exportModelCSV');
 }
 
@@ -1762,15 +1912,17 @@ function renderProjectCostTable(byProject) {
   const sorted = sortProjects(byProject);
   const shown = sorted.slice(0, shownCount(projectLimit, sorted.length));
   document.getElementById('project-cost-body').innerHTML = shown.map(p => {
+    const k = 'p|' + p.project + '|';
     return `<tr>
       <td>${esc(p.project)}</td>
-      <td class="num">${p.sessions}</td>
-      <td class="num">${fmt(p.turns)}</td>
-      <td class="num">${fmt(p.input)}</td>
-      <td class="num">${fmt(p.output)}</td>
-      <td class="cost">${fmtCost(p.cost)}</td>
+      <td class="num">${animNum(k + 'sessions', p.sessions, 'int')}</td>
+      <td class="num">${animNum(k + 'turns', p.turns, 'tok')}</td>
+      <td class="num">${animNum(k + 'input', p.input, 'tok')}</td>
+      <td class="num">${animNum(k + 'output', p.output, 'tok')}</td>
+      <td class="cost">${animNum(k + 'cost', p.cost, 'cost')}</td>
     </tr>`;
   }).join('');
+  runCellAnims('project-cost-body');
   renderTableToggle('project-cost-foot', sorted.length, projectLimit, 'lessProjectRows', 'moreProjectRows', 'exportProjectsCSV');
 }
 
@@ -1812,16 +1964,18 @@ function renderProjectBranchCostTable(rows) {
   const sorted = sortProjectBranch(rows);
   const shown = sorted.slice(0, shownCount(branchLimit, sorted.length));
   document.getElementById('project-branch-cost-body').innerHTML = shown.map(pb => {
+    const k = 'b|' + pb.project + '|' + (pb.branch || '') + '|';
     return `<tr>
       <td>${esc(pb.project)}</td>
       <td class="muted" style="font-family:monospace">${esc(pb.branch || '\u2014')}</td>
-      <td class="num">${pb.sessions}</td>
-      <td class="num">${fmt(pb.turns)}</td>
-      <td class="num">${fmt(pb.input)}</td>
-      <td class="num">${fmt(pb.output)}</td>
-      <td class="cost">${fmtCost(pb.cost)}</td>
+      <td class="num">${animNum(k + 'sessions', pb.sessions, 'int')}</td>
+      <td class="num">${animNum(k + 'turns', pb.turns, 'tok')}</td>
+      <td class="num">${animNum(k + 'input', pb.input, 'tok')}</td>
+      <td class="num">${animNum(k + 'output', pb.output, 'tok')}</td>
+      <td class="cost">${animNum(k + 'cost', pb.cost, 'cost')}</td>
     </tr>`;
   }).join('');
+  runCellAnims('project-branch-cost-body');
   renderTableToggle('project-branch-cost-foot', sorted.length, branchLimit, 'lessBranchRows', 'moreBranchRows', 'exportProjectBranchCSV');
 }
 
@@ -1856,8 +2010,7 @@ function downloadCSV(reportType, header, rows) {
 function exportModelCSV() {
   const header = ['Model', 'Turns', 'Input', 'Output', 'Cache Read', 'Cache Creation', 'Est. Cost'];
   const rows = sortModels(lastByModel).map(m => {
-    const cost = calcCost(m.model, m.input, m.output, m.cache_read, m.cache_creation);
-    return [m.model, m.turns, m.input, m.output, m.cache_read, m.cache_creation, cost.toFixed(4)];
+    return [m.model, m.turns, m.input, m.output, m.cache_read, m.cache_creation, m.cost.toFixed(4)];
   });
   downloadCSV('cost_by_model', header, rows);
 }
@@ -1865,7 +2018,7 @@ function exportModelCSV() {
 function exportSessionsCSV() {
   const header = ['Session', 'Project', 'Title', 'Last Active', 'Duration (min)', 'Model', 'Turns', 'Input', 'Output', 'Cache Read', 'Cache Creation', 'Est. Cost'];
   const rows = lastFilteredSessions.map(s => {
-    const cost = calcCost(s.model, s.input, s.output, s.cache_read, s.cache_creation);
+    const cost = calcCost(s.model, s.input, s.output, s.cache_read, s.cache_creation, s.last_date);
     return [s.session_id, s.project, s.topic, s.last, s.duration_min, s.model, s.turns, s.input, s.output, s.cache_read, s.cache_creation, cost.toFixed(4)];
   });
   downloadCSV('sessions', header, rows);
@@ -1891,7 +2044,7 @@ function exportDispatchesCSV() {
   const header = ['Type', 'Agent ID', 'Started', 'Model', 'Turns', 'Tool Uses', 'Duration (ms)', 'Input', 'Output', 'Cache Read', 'Cache Creation', 'Total Tokens', 'Est. Cost', 'Status'];
   const rows = lastFilteredDispatches.map(d => {
     const total = d.input + d.output + d.cache_read + d.cache_creation;
-    const cost = calcCost(d.model, d.input, d.output, d.cache_read, d.cache_creation);
+    const cost = calcCost(d.model, d.input, d.output, d.cache_read, d.cache_creation, d.start);
     return [d.agent_type, d.agent_id, d.start, d.model, d.turns,
             d.tool_uses != null ? d.tool_uses : '', d.duration_ms != null ? d.duration_ms : '',
             d.input, d.output, d.cache_read, d.cache_creation, total, cost.toFixed(4), d.status || ''];
@@ -1917,6 +2070,7 @@ async function triggerRescan() {
 }
 
 // ── Data loading ───────────────────────────────────────────────────────────
+let lastDataFingerprint = null;
 async function loadData() {
   try {
     const resp = await fetch('/api/data');
@@ -1931,10 +2085,22 @@ async function loadData() {
       if (rawData === null) setTimeout(loadData, 3000);
       return;
     }
-    const refreshNote = rangeIncludesToday(selectedRange) ? '<br>Auto-refresh in 30s' : '';
+    const refreshNote = rangeIncludesToday(selectedRange) ? '<br>Auto-refresh in 2s' : '';
     document.getElementById('meta').innerHTML = 'Updated: ' + esc(d.generated_at) + refreshNote;
 
     const isFirstLoad = rawData === null;
+
+    // Skip the full chart/table re-render when the usage data hasn't changed
+    // since the last poll. generated_at is excluded from the comparison (the
+    // server stamps it on every request), and today's date is included so
+    // date-relative ranges ('Today', 'This Week') still re-render once after
+    // a midnight rollover. User actions (filter/range/sort changes) call
+    // applyFilter() directly, so they are unaffected by this gate.
+    const { generated_at, ...payload } = d;
+    const fingerprint = new Date().toISOString().slice(0, 10) + JSON.stringify(payload);
+    if (!isFirstLoad && fingerprint === lastDataFingerprint) return;
+    lastDataFingerprint = fingerprint;
+
     rawData = d;
 
     if (isFirstLoad) {
@@ -1964,7 +2130,7 @@ let autoRefreshTimer = null;
 function scheduleAutoRefresh() {
   if (autoRefreshTimer) { clearInterval(autoRefreshTimer); autoRefreshTimer = null; }
   if (rangeIncludesToday(selectedRange)) {
-    autoRefreshTimer = setInterval(loadData, 30000);
+    autoRefreshTimer = setInterval(loadData, 2000);
   }
 }
 
@@ -2234,6 +2400,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
         elif path == "/api/data":
+            # Ingest new transcript lines first (throttled + incremental) so
+            # the auto-refresh reflects sessions that are chatting right now.
+            _scan_if_stale()
             # Pass DB_PATH explicitly: get_dashboard_data's default arg is frozen
             # to the original module global at def time, so a bare call would ignore
             # a monkey-patched dashboard.DB_PATH (same contract as /api/rescan). This

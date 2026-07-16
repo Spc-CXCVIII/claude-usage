@@ -27,6 +27,7 @@ PRICING = {
     "claude-opus-4-7":   {"input": 5.00, "output": 25.00, "cache_read": 0.50, "cache_write": 6.25},
     "claude-opus-4-6":   {"input": 5.00, "output": 25.00, "cache_read": 0.50, "cache_write": 6.25},
     "claude-opus-4-5":   {"input": 5.00, "output": 25.00, "cache_read": 0.50, "cache_write": 6.25},
+    "claude-sonnet-5":   {"input": 3.00, "output": 15.00, "cache_read": 0.30, "cache_write": 3.75},
     "claude-sonnet-4-7": {"input": 3.00, "output": 15.00, "cache_read": 0.30, "cache_write": 3.75},
     "claude-sonnet-4-6": {"input": 3.00, "output": 15.00, "cache_read": 0.30, "cache_write": 3.75},
     "claude-sonnet-4-5": {"input": 3.00, "output": 15.00, "cache_read": 0.30, "cache_write": 3.75},
@@ -35,28 +36,51 @@ PRICING = {
     "claude-haiku-4-5":  {"input": 1.00, "output":  5.00, "cache_read": 0.10, "cache_write": 1.25},
 }
 
-def get_pricing(model):
+# Introductory launch pricing, applied by usage date. PRICING above holds the
+# standard (post-promo) rates so the parity test with the dashboard JS stays
+# simple; get_pricing swaps in the promo rates when the row's date falls inside
+# the window. Rows without a date (all-time aggregates) price as of today.
+INTRO_PRICING = {
+    # Sonnet 5 launch discount ($2/$10) through 2026-08-31; standard $3/$15 after.
+    "claude-sonnet-5": {
+        "until": "2026-08-31",
+        "rates": {"input": 2.00, "output": 10.00, "cache_read": 0.20, "cache_write": 2.50},
+    },
+}
+
+def _resolve_pricing_key(model):
     if not model:
         return None
     if model in PRICING:
-        return PRICING[model]
+        return model
     for key in PRICING:
         if model.startswith(key):
-            return PRICING[key]
+            return key
     # Substring fallback: match model family by keyword
     m = model.lower()
     if "fable" in m or "mythos" in m:
-        return PRICING["claude-fable-5"]
+        return "claude-fable-5"
     if "opus" in m:
-        return PRICING["claude-opus-4-8"]
+        return "claude-opus-4-8"
     if "sonnet" in m:
-        return PRICING["claude-sonnet-4-6"]
+        return "claude-sonnet-4-6"
     if "haiku" in m:
-        return PRICING["claude-haiku-4-5"]
+        return "claude-haiku-4-5"
     return None
 
-def calc_cost(model, inp, out, cache_read, cache_creation):
-    p = get_pricing(model)
+def get_pricing(model, date=None):
+    key = _resolve_pricing_key(model)
+    if not key:
+        return None
+    intro = INTRO_PRICING.get(key)
+    if intro:
+        day = (date or datetime.now().strftime("%Y-%m-%d"))[:10]
+        if day <= intro["until"]:
+            return intro["rates"]
+    return PRICING[key]
+
+def calc_cost(model, inp, out, cache_read, cache_creation, date=None):
+    p = get_pricing(model, date)
     if not p:
         return 0.0
     return (
@@ -150,7 +174,7 @@ def cmd_today():
     total_cost = 0.0
 
     for r in rows:
-        cost = calc_cost(r["model"], r["inp"] or 0, r["out"] or 0, r["cr"] or 0, r["cc"] or 0)
+        cost = calc_cost(r["model"], r["inp"] or 0, r["out"] or 0, r["cr"] or 0, r["cc"] or 0, date=today)
         total_cost += cost
         total_inp += r["inp"] or 0
         total_out += r["out"] or 0
@@ -224,15 +248,21 @@ def cmd_week():
         conn.close()
         return
 
-    # Aggregate per-day across models (with per-turn cost attribution)
+    # Aggregate per-day across models (with per-turn cost attribution), and
+    # per-model costs from the same dated rows — pricing can change with the
+    # date (e.g. Sonnet 5's intro window), so cost must be computed against
+    # each row's day, not against the whole range at once.
     per_day = {}
+    per_model_cost = {}
     for r in by_day_model:
         d = r["day"]
         bucket = per_day.setdefault(d, {"turns": 0, "inp": 0, "out": 0, "cost": 0.0})
+        cost = calc_cost(r["model"], r["inp"] or 0, r["out"] or 0, r["cr"] or 0, r["cc"] or 0, date=d)
         bucket["turns"] += r["turns"]
         bucket["inp"]   += r["inp"] or 0
         bucket["out"]   += r["out"] or 0
-        bucket["cost"]  += calc_cost(r["model"], r["inp"] or 0, r["out"] or 0, r["cr"] or 0, r["cc"] or 0)
+        bucket["cost"]  += cost
+        per_model_cost[r["model"]] = per_model_cost.get(r["model"], 0.0) + cost
 
     print("  By Day:")
     for i in range(7):
@@ -246,7 +276,7 @@ def cmd_week():
     total_inp = total_out = total_cr = total_cc = total_turns = 0
     total_cost = 0.0
     for r in by_model:
-        cost = calc_cost(r["model"], r["inp"] or 0, r["out"] or 0, r["cr"] or 0, r["cc"] or 0)
+        cost = per_model_cost.get(r["model"], 0.0)
         total_cost  += cost
         total_inp   += r["inp"] or 0
         total_out   += r["out"] or 0
@@ -344,11 +374,25 @@ def cmd_stats():
         )
     """).fetchone()
 
-    # Build total cost across all models
-    total_cost = sum(
-        calc_cost(r["model"], r["inp"] or 0, r["out"] or 0, r["cr"] or 0, r["cc"] or 0)
-        for r in by_model
-    )
+    # Cost per model from day-grouped rows: pricing can change with the date
+    # (e.g. Sonnet 5's intro window), so each day is priced at the rate in
+    # effect on that day rather than pricing the whole history at once.
+    cost_rows = conn.execute("""
+        SELECT
+            substr(timestamp, 1, 10)   as day,
+            COALESCE(model, 'unknown') as model,
+            SUM(input_tokens)          as inp,
+            SUM(output_tokens)         as out,
+            SUM(cache_read_tokens)     as cr,
+            SUM(cache_creation_tokens) as cc
+        FROM turns
+        GROUP BY day, model
+    """).fetchall()
+    per_model_cost = {}
+    for r in cost_rows:
+        cost = calc_cost(r["model"], r["inp"] or 0, r["out"] or 0, r["cr"] or 0, r["cc"] or 0, date=r["day"])
+        per_model_cost[r["model"]] = per_model_cost.get(r["model"], 0.0) + cost
+    total_cost = sum(per_model_cost.values())
 
     print()
     hr("=")
@@ -373,7 +417,7 @@ def cmd_stats():
 
     print("  By Model:")
     for r in by_model:
-        cost = calc_cost(r["model"], r["inp"] or 0, r["out"] or 0, r["cr"] or 0, r["cc"] or 0)
+        cost = per_model_cost.get(r["model"], 0.0)
         print(f"    {r['model']:<30}  sessions={r['sessions']:<4}  turns={fmt(r['turns'] or 0):<6}  "
               f"in={fmt(r['inp'] or 0):<8}  out={fmt(r['out'] or 0):<8}  cost={fmt_cost(cost)}")
 
