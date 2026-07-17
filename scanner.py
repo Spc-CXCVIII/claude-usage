@@ -221,6 +221,66 @@ def _backfill_topics(conn, jsonl_files):
     return len(titles)
 
 
+def _resync_missing_topics(conn, jsonl_files):
+    """Cheap, ongoing repair for sessions still missing a topic.
+
+    _backfill_topics only ever runs once (a full-tree sweep, meant for DBs
+    migrating from before topic support existed). But a session can end up
+    topic-less in steady state too: Claude Code sometimes appends the
+    custom-title/ai-title record to a transcript *after* the scanner already
+    read past that point, and if the session's file never grows again (the
+    session ended), the normal incremental path never revisits those bytes —
+    only a fresh backfill would, and the one-time flag already spent itself.
+
+    Rather than re-reading the whole transcript tree every scan (what
+    _backfill_topics does, hence its one-time gating), this targets just the
+    currently-untitled sessions: Claude Code always names a session's main
+    transcript `<session_id>.jsonl`, so each one requires opening at most one
+    small file. Safe to run on every scan. Returns the number filled.
+    """
+    needing = {r["session_id"] for r in conn.execute(
+        "SELECT session_id FROM sessions WHERE topic IS NULL OR topic = ''")}
+    if not needing:
+        return 0
+
+    by_session_id = {}
+    for f in jsonl_files:
+        stem = Path(f).stem
+        if stem in needing:
+            by_session_id[stem] = f
+
+    titles = {}
+    has_custom = set()
+    for sid, filepath in by_session_id.items():
+        try:
+            with open(filepath, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if "title" not in line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    title = _extract_title(record)
+                    if not title or record.get("sessionId") != sid:
+                        continue
+                    if record.get("type") == "custom-title":
+                        titles[sid] = title
+                        has_custom.add(sid)
+                    elif sid not in has_custom:
+                        titles.setdefault(sid, title)
+        except Exception as e:
+            print(f"  Warning: error reading {filepath}: {e}")
+
+    for sid, title in titles.items():
+        conn.execute(
+            "UPDATE sessions SET topic = ? WHERE session_id = ? "
+            "AND (topic IS NULL OR topic = '')", (title, sid))
+    if titles:
+        conn.commit()
+    return len(titles)
+
+
 def project_name_from_cwd(cwd):
     """Derive a friendly project name from cwd path."""
     if not cwd:
@@ -286,6 +346,42 @@ def extract_agent_dispatch(record):
         "total_tokens": tur.get("totalTokens"),
         "total_duration_ms": tur.get("totalDurationMs"),
         "tool_use_count": tur.get("totalToolUseCount"),
+    }
+
+
+def extract_agent_meta_sidecar(meta_path):
+    """Pull subagent identity from an ``agent-<id>.meta.json`` sidecar.
+
+    Claude Code now dispatches subagents asynchronously; the parent's
+    toolUseResult that closes out that kind of dispatch never carries
+    ``agentType`` (only ``agentId``/``status``), so ``extract_agent_dispatch``
+    can't recover it. Instead Claude Code writes it into this sidecar file,
+    next to the subagent's own ``agent-<id>.jsonl`` transcript under a
+    ``subagents/`` directory — that's the only place it's available for
+    async dispatches.
+    """
+    p = Path(meta_path)
+    if not p.name.endswith(".meta.json"):
+        return None
+    stem = p.name[:-len(".meta.json")]
+    if not stem.startswith("agent-"):
+        return None
+    try:
+        meta = json.loads(p.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    agent_type = meta.get("agentType")
+    if not agent_type:
+        return None
+    return {
+        "agent_id": stem[len("agent-"):],
+        "agent_type": agent_type,
+        "dispatched_in_session": p.parent.parent.name,
+        "completed_at": None,
+        "status": None,
+        "total_tokens": None,
+        "total_duration_ms": None,
+        "tool_use_count": None,
     }
 
 
@@ -605,6 +701,31 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
         conn.commit()
         if verbose and filled:
             print(f"Backfilled topic for {filled} existing session(s).")
+
+    # Ongoing repair, every scan (not gated like the one-time backfill above):
+    # catches sessions whose title landed in the transcript after the scanner
+    # last read that far. Cheap — targets only currently-untitled sessions.
+    resynced = _resync_missing_topics(conn, jsonl_files)
+    if verbose and resynced:
+        print(f"Resynced topic for {resynced} session(s) from title records.")
+
+    # Sync subagent agentType from `.meta.json` sidecars every scan (cheap —
+    # tiny files) rather than gating on the parent jsonl's mtime like the main
+    # loop below. This also backfills subagent dispatches whose transcript was
+    # already scanned before this existed, which an mtime-gated hook would miss.
+    sidecar_agents = []
+    for d in dirs_to_scan:
+        if not d.exists():
+            continue
+        for meta_path in glob.glob(str(d / "**" / "subagents" / "*.meta.json"), recursive=True):
+            dispatch = extract_agent_meta_sidecar(meta_path)
+            if dispatch:
+                sidecar_agents.append(dispatch)
+    if sidecar_agents:
+        upsert_agents(conn, sidecar_agents)
+        conn.commit()
+        if verbose:
+            print(f"Synced agent type for {len(sidecar_agents)} subagent dispatch(es) from meta.json sidecars.")
 
     new_files = 0
     updated_files = 0

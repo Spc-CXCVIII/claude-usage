@@ -10,7 +10,7 @@ from pathlib import Path
 from scanner import (
     get_db, init_db, project_name_from_cwd, parse_jsonl_file,
     aggregate_sessions, upsert_sessions, insert_turns, scan,
-    _backfill_topics, _meta_get, _meta_set,
+    _backfill_topics, _resync_missing_topics, _meta_get, _meta_set,
 )
 
 
@@ -902,7 +902,12 @@ class TestTopicBackfill(unittest.TestCase):
         self.assertEqual(result["skipped"], 1)
         self.assertEqual(self._row()["topic"], "Backfilled topic")
 
-    def test_backfill_runs_only_once(self):
+    def test_full_backfill_sweep_runs_only_once(self):
+        """The full-tree _backfill_topics sweep (migration-time only) fires
+        once, gated by the schema_meta marker — but the lighter per-scan
+        _resync_missing_topics (see TestTopicResync) still heals a topic that
+        goes missing afterwards, since Claude Code can append a session's
+        title to its transcript well after the scanner last read that file."""
         with open(self.filepath, "w") as f:
             f.write(_make_user_record(session_id="sess-1",
                                       timestamp="2026-04-08T09:00:00Z") + "\n")
@@ -915,16 +920,16 @@ class TestTopicBackfill(unittest.TestCase):
         self._scan()  # backfill fires, records 'done'
         self.assertEqual(self._row()["topic"], "Only once")
 
-        # The one-time backfill is now recorded as done.
+        # The one-time full-tree backfill is now recorded as done...
         conn = get_db(self.db_path)
         self.assertEqual(_meta_get(conn, "topic_backfill_done"), "1")
-        # Null the topic WITHOUT clearing the marker: a later scan must not
-        # refill it (the one-time backfill already ran).
+        # ...but nulling the topic without clearing the marker still gets
+        # refilled on the next scan — by _resync_missing_topics, not backfill.
         conn.execute("UPDATE sessions SET topic = NULL WHERE session_id = 'sess-1'")
         conn.commit()
         conn.close()
         self._scan()
-        self.assertIsNone(self._row()["topic"])
+        self.assertEqual(self._row()["topic"], "Only once")
 
     def test_backfill_does_not_touch_token_totals(self):
         with open(self.filepath, "w") as f:
@@ -962,6 +967,129 @@ class TestTopicBackfill(unittest.TestCase):
         self.assertEqual(conn.execute("SELECT topic FROM sessions WHERE session_id='keep'").fetchone()[0], "existing")
         self.assertEqual(conn.execute("SELECT topic FROM sessions WHERE session_id='fill'").fetchone()[0], "filled")
         conn.close()
+
+
+class TestTopicResync(unittest.TestCase):
+    """_resync_missing_topics: an ongoing (every-scan) repair, distinct from
+    the one-time _backfill_topics sweep. Reproduces the dashboard's 'Untitled'
+    bug: a session whose title landed in the transcript after the scanner had
+    already read past that point (or before a scanner fix could capture it),
+    and whose file then stopped growing — so the normal incremental scan
+    never revisits it and only a fresh sweep heals it."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.projects_dir = Path(self.tmpdir) / "projects" / "user" / "proj"
+        self.projects_dir.mkdir(parents=True)
+        self.db_path = Path(self.tmpdir) / "usage.db"
+
+    def _scan(self):
+        return scan(projects_dir=self.projects_dir.parent.parent,
+                    db_path=self.db_path, verbose=False)
+
+    def _row(self, session_id):
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM sessions WHERE session_id = ?",
+                           (session_id,)).fetchone()
+        conn.close()
+        return row
+
+    def test_heals_a_topic_that_went_missing_after_a_full_scan(self):
+        # Claude Code names a session's main transcript <session_id>.jsonl.
+        path = self.projects_dir / "sess-1.jsonl"
+        with open(path, "w") as f:
+            f.write(_make_user_record(session_id="sess-1",
+                                      timestamp="2026-04-08T09:00:00Z") + "\n")
+            f.write(_make_assistant_record(session_id="sess-1",
+                                           timestamp="2026-04-08T09:01:00Z") + "\n")
+            f.write(_make_ai_title_record(session_id="sess-1",
+                                          title="Recovered topic") + "\n")
+        self._scan()
+        self.assertEqual(self._row("sess-1")["topic"], "Recovered topic")
+
+        # Topic goes missing without touching the file or any backfill
+        # marker — file's mtime is unchanged, so the normal incremental path
+        # would skip it entirely; only the resync sweep can fix this.
+        conn = get_db(self.db_path)
+        conn.execute("UPDATE sessions SET topic = NULL WHERE session_id = 'sess-1'")
+        conn.commit()
+        conn.close()
+
+        self._scan()
+        self.assertEqual(self._row("sess-1")["topic"], "Recovered topic")
+
+    def test_does_not_clobber_an_existing_topic(self):
+        path = self.projects_dir / "sess-1.jsonl"
+        with open(path, "w") as f:
+            f.write(_make_custom_title_record(session_id="sess-1", title="Different title") + "\n")
+        conn = get_db(self.db_path)
+        init_db(conn)
+        conn.execute("INSERT INTO sessions (session_id, topic) VALUES ('sess-1', 'Kept title')")
+        conn.commit()
+        filled = _resync_missing_topics(conn, [str(path)])
+        self.assertEqual(filled, 0)
+        self.assertEqual(conn.execute(
+            "SELECT topic FROM sessions WHERE session_id='sess-1'").fetchone()[0], "Kept title")
+        conn.close()
+
+    def test_leaves_genuinely_titleless_session_alone(self):
+        # No custom-title / ai-title record anywhere in the file: Claude Code
+        # itself never generated one (e.g. a very short session).
+        path = self.projects_dir / "sess-1.jsonl"
+        with open(path, "w") as f:
+            f.write(_make_user_record(session_id="sess-1") + "\n")
+            f.write(_make_assistant_record(session_id="sess-1") + "\n")
+        self._scan()
+        self.assertIsNone(self._row("sess-1")["topic"])
+        self._scan()  # resync runs again; still nothing to find
+        self.assertIsNone(self._row("sess-1")["topic"])
+
+    def test_matches_session_by_transcript_filename_not_full_tree_scan(self):
+        # Two files on disk; only the one named after the needing session_id
+        # should be opened. A decoy file for another session must not be
+        # mistaken for it even though it also carries a title record.
+        conn = get_db(self.db_path)
+        init_db(conn)
+        conn.execute("INSERT INTO sessions (session_id, topic) VALUES ('fill', NULL)")
+        conn.commit()
+
+        decoy = self.projects_dir / "other-session.jsonl"
+        with open(decoy, "w") as f:
+            f.write(_make_custom_title_record(session_id="fill", title="WRONG FILE") + "\n")
+        target = self.projects_dir / "fill.jsonl"
+        with open(target, "w") as f:
+            f.write(_make_ai_title_record(session_id="fill", title="Right file") + "\n")
+
+        filled = _resync_missing_topics(conn, [str(decoy), str(target)])
+        self.assertEqual(filled, 1)
+        self.assertEqual(conn.execute(
+            "SELECT topic FROM sessions WHERE session_id='fill'").fetchone()[0], "Right file")
+        conn.close()
+
+    def test_does_not_touch_token_totals(self):
+        path = self.projects_dir / "sess-1.jsonl"
+        with open(path, "w") as f:
+            f.write(_make_user_record(session_id="sess-1",
+                                      timestamp="2026-04-08T09:00:00Z") + "\n")
+            f.write(_make_assistant_record(session_id="sess-1",
+                                           timestamp="2026-04-08T09:01:00Z",
+                                           input_tokens=100, output_tokens=50) + "\n")
+            f.write(_make_custom_title_record(session_id="sess-1", title="No drift") + "\n")
+        self._scan()
+        before = self._row("sess-1")
+
+        conn = get_db(self.db_path)
+        conn.execute("UPDATE sessions SET topic = NULL WHERE session_id = 'sess-1'")
+        conn.commit()
+        conn.close()
+
+        self._scan()
+        after = self._row("sess-1")
+        self.assertEqual(after["topic"], "No drift")
+        self.assertEqual(after["total_input_tokens"], before["total_input_tokens"])
+        self.assertEqual(after["total_output_tokens"], before["total_output_tokens"])
+        self.assertEqual(after["turn_count"], before["turn_count"])
 
 
 if __name__ == "__main__":
