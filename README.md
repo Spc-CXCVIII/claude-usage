@@ -41,42 +41,35 @@ Captures usage from:
 
 No `pip install`, no virtual environment, no build step.
 
-### macOS / Linux (Homebrew)
-```
-brew tap phuryn/claude-usage https://github.com/phuryn/claude-usage
-brew install phuryn/claude-usage/claude-usage
-claude-usage dashboard
-```
-
-> Homebrew has disabled installing a formula from an arbitrary raw URL, so tap the repo first (thanks @adrianlungu for the working incantation in #46).
-
-After install, the `claude-usage` command is on your `PATH` and accepts the same subcommands as `python cli.py` (`scan`, `today`, `stats`, `dashboard`).
+> No Homebrew tap for this fork — use `uv tool` / `pipx` below instead.
 
 ### Any OS (uv tool / pipx)
 ```
-uv tool install git+https://github.com/phuryn/claude-usage
+uv tool install git+https://github.com/Spc-CXCVIII/claude-usage
 claude-usage dashboard
 ```
 
-Installs the `claude-usage` command without a clone (works with [`pipx`](https://pipx.pypa.io/) too: `pipx install git+https://github.com/phuryn/claude-usage`). The tool stays dependency-free — this only adds packaging metadata, no third-party runtime deps (#144).
+Installs the `claude-usage` command without a clone (works with [`pipx`](https://pipx.pypa.io/) too: `pipx install git+https://github.com/Spc-CXCVIII/claude-usage`). The tool stays dependency-free — this only adds packaging metadata, no third-party runtime deps (#144).
+
+After install, the `claude-usage` command is on your `PATH` and accepts the same subcommands as `python cli.py` (`scan`, `today`, `stats`, `dashboard`).
 
 ### macOS / Linux (clone)
 ```
-git clone https://github.com/phuryn/claude-usage
+git clone https://github.com/Spc-CXCVIII/claude-usage
 cd claude-usage
 python3 cli.py dashboard
 ```
 
 ### Windows
 ```
-git clone https://github.com/phuryn/claude-usage
+git clone https://github.com/Spc-CXCVIII/claude-usage
 cd claude-usage
 python cli.py dashboard
 ```
 
 ### Docker
 ```
-git clone https://github.com/phuryn/claude-usage
+git clone https://github.com/Spc-CXCVIII/claude-usage
 cd claude-usage
 bash scripts/run-docker.sh
 ```
@@ -184,7 +177,7 @@ See [vscode-extension/README.md](vscode-extension/README.md) for settings, comma
 | `scanner.py` | Parses JSONL transcripts, writes to `~/.claude/usage.db` |
 | `dashboard.py` | HTTP server + single-page HTML/JS dashboard |
 | `cli.py` | `scan`, `today`, `stats`, `dashboard` commands |
-| `Formula/claude-usage.rb` | Homebrew formula — install with `brew tap phuryn/claude-usage` then `brew install phuryn/claude-usage/claude-usage` |
+| `Formula/claude-usage.rb` | Homebrew formula from upstream — unused in this fork (no tap published; use `uv tool` / `pipx` instead) |
 | `vscode-extension/` | VS Code extension — embeds the dashboard inside VS Code |
 | `Dockerfile` | Container image definition |
 | `scripts/run-docker.sh` | Build and run the dashboard in Docker with a read-only `~/.claude` mount |

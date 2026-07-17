@@ -22,8 +22,8 @@ keywords = ["claude", "claude-code", "usage", "tokens", "cost", "dashboard"]
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/phuryn/claude-usage"
-Issues = "https://github.com/phuryn/claude-usage/issues"
+Homepage = "https://github.com/Spc-CXCVIII/claude-usage"
+Issues = "https://github.com/Spc-CXCVIII/claude-usage/issues"
 
 [project.scripts]
 claude-usage = "cli:main"
