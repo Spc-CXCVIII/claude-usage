@@ -139,6 +139,27 @@ def get_dashboard_data(db_path=DB_PATH):
         "turns":  r["turns"] or 0,
     } for r in hourly_rows]
 
+    # ── Tool usage per day per model (client filters by range + model) ────────
+    # tool_name is the first tool_use block of the assistant turn (or NULL for
+    # text-only responses), so this counts "turns that led with tool X".
+    tool_rows = conn.execute("""
+        SELECT
+            substr(timestamp, 1, 10)                  as day,
+            COALESCE(NULLIF(tool_name, ''), '(no tool)') as tool,
+            COALESCE(NULLIF(model, ''), 'unknown')    as model,
+            COUNT(*)                                  as turns
+        FROM turns
+        GROUP BY day, tool, COALESCE(NULLIF(model, ''), 'unknown')
+        ORDER BY day, tool
+    """).fetchall()
+
+    tool_daily = [{
+        "day":   r["day"],
+        "tool":  r["tool"],
+        "model": r["model"],
+        "turns": r["turns"] or 0,
+    } for r in tool_rows]
+
     # ── All sessions (client filters by range and model) ──────────────────────
     session_rows = conn.execute("""
         SELECT
@@ -269,6 +290,7 @@ def get_dashboard_data(db_path=DB_PATH):
         "all_models":      all_models,
         "daily_by_model":  daily_by_model,
         "hourly_by_model": hourly_by_model,
+        "tool_daily":      tool_daily,
         "sessions_all":    sessions_all,
         "subagent_by_type": subagent_by_type,
         "top_dispatches":  top_dispatches,
@@ -374,6 +396,27 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .date-input:hover, .date-input:focus { border-color: var(--accent); outline: none; }
   .date-input::-webkit-calendar-picker-indicator { cursor: pointer; opacity: 0.6; }
   .cycle-tag { display: inline-block; margin-left: 8px; padding: 1px 7px; border-radius: var(--radius-sm); font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; background: rgba(217,119,87,0.15); color: var(--accent); border: 1px solid rgba(217,119,87,0.35); }
+  .delta-up { color: var(--red); }
+  .delta-down { color: var(--green); }
+
+  /* Cost heatmap — GitHub-contribution-style grid. Columns are weeks (Mon–Sun
+     rows), filled column-by-column via grid-auto-flow. Sequential single-hue
+     ramp of the accent (dark → bright) per magnitude; cells carry native title
+     tooltips. Scrolls horizontally in narrow panels instead of squashing. */
+  #sec-heatmap { display: flex; flex-direction: column; }
+  .heatmap-scroll { overflow-x: auto; padding-bottom: 4px; flex: 1; display: flex; }
+  .heatmap-scroll .hm-flex { margin: auto; }
+  .hm-flex { display: inline-flex; gap: 8px; align-items: flex-end; }
+  .hm-daylabels { display: grid; grid-template-rows: repeat(7, 16px); gap: 3px; font-size: 9px; color: var(--muted); text-align: right; }
+  .hm-daylabels span { line-height: 16px; }
+  .hm-months { display: grid; grid-auto-flow: column; grid-auto-columns: 19px; font-size: 9px; color: var(--muted); height: 14px; margin-bottom: 2px; }
+  .hm-months span { overflow: visible; white-space: nowrap; }
+  .hm-cells { display: grid; grid-auto-flow: column; grid-template-rows: repeat(7, 16px); grid-auto-columns: 16px; gap: 3px; }
+  .hm-cell { width: 16px; height: 16px; border-radius: 2px; background: #242526; }
+  .hm-cell:hover { outline: 1px solid var(--text); outline-offset: 0; }
+  .hm-legend { display: inline-flex; align-items: center; gap: 3px; font-size: 11px; color: var(--muted); }
+  .hm-legend .hm-cell { cursor: default; width: 12px; height: 12px; }
+  .hm-legend .hm-cell:hover { outline: none; }
 
   .container { max-width: 1400px; margin: 0 auto; padding: 24px; }
   /* Ledger strip, not a row of separate rounded cards: the 1px grid gap over a
@@ -381,11 +424,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
      both directions, and keeps working automatically when auto-fit wraps to a
      second row — a set of per-card borders can't do that without knowing the
      row count in advance. */
-  .stats-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 1px; background: var(--border); border: 1px solid var(--border); border-radius: var(--radius-md); overflow: hidden; margin-bottom: 24px; }
-  .stat-card { background: var(--card); padding: 16px 20px; }
-  .stat-card .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 6px; }
-  .stat-card .value { font-size: 22px; font-weight: 700; font-family: var(--font-mono); letter-spacing: -0.02em; }
-  .stat-card .sub { color: var(--muted); font-size: 11px; margin-top: 4px; }
+  .stats-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 1px; background: var(--border); border: 1px solid var(--border); border-radius: var(--radius-md); overflow: hidden; margin-bottom: 24px; }
+  .stat-card { background: var(--card); padding: 14px 16px; }
+  .stat-card .label { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 6px; }
+  .stat-card .value { font-size: 17px; font-weight: 700; font-family: var(--font-mono); letter-spacing: -0.02em; }
+  .stat-card .sub { color: var(--muted); font-size: 10px; margin-top: 4px; }
 
   .charts-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 24px; }
   /* min-width:0 lets the grid column shrink below the canvas's intrinsic
@@ -561,6 +604,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <button class="jump-link" data-target="sec-models">By Model</button>
       <button class="jump-link" data-target="sec-projects">Top Projects</button>
       <button class="jump-link" data-target="sec-subagents">Subagents</button>
+      <button class="jump-link" data-target="sec-tools">By Tool</button>
+      <button class="jump-link" data-target="sec-heatmap">Heatmap</button>
     </div>
   </div>
   <div class="jump-menu jump-menu-end">
@@ -570,6 +615,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     </button>
     <div class="jump-panel">
       <button class="jump-link" data-target="sec-billing">Billing Cycles</button>
+      <button class="jump-link" data-target="sec-cache">Cache Efficiency</button>
       <button class="jump-link" data-target="sec-cost-model">Cost by Model</button>
       <button class="jump-link" data-target="sec-dispatches">Dispatches</button>
       <button class="jump-link" data-target="sec-sessions">Sessions</button>
@@ -612,17 +658,38 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <h2><span class="card-caret">&#9656;</span><span id="subagent-chart-title">Subagent Tokens by Type</span></h2>
       <div class="chart-wrap"><canvas id="chart-subagent"></canvas></div>
     </div>
+    <div class="chart-card" id="sec-tools" data-card="tools-chart">
+      <h2><span class="card-caret">&#9656;</span><span id="tools-chart-title">Turns by Tool</span></h2>
+      <div class="chart-wrap"><canvas id="chart-tools"></canvas></div>
+    </div>
+    <div class="chart-card" id="sec-heatmap" data-card="heatmap">
+      <div class="chart-header">
+        <h2><span class="card-caret">&#9656;</span><span>Daily Cost Heatmap — Last 26 Weeks</span></h2>
+        <div class="chart-header-right"><span class="hm-legend" id="heatmap-legend"></span></div>
+      </div>
+      <div class="heatmap-scroll" id="heatmap-scroll"></div>
+    </div>
   </div>
   <div class="table-card" id="sec-billing" data-card="billing-cycles">
     <div class="section-header"><div class="section-title"><span class="card-caret">&#9656;</span>Billing Cycles <span class="info-icon" tabindex="0" role="img" aria-label="About this table" title="One row per subscription month, anchored on the Sub Start day — e.g. a June 22 start bills the 22nd of each month through the 21st of the next. Respects the model filter; ignores the date-range filter."><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg></span></div><button class="export-btn" onclick="exportCyclesCSV()" title="Export all billing cycles to CSV">&#x2913; CSV</button></div>
     <table>
       <thead><tr>
         <th>Cycle</th><th>Days</th><th>Turns</th><th>Input</th><th>Output</th>
-        <th>Cache Read</th><th>Cache Creation</th><th>Est. Cost</th>
+        <th>Cache Read</th><th>Cache Creation</th><th>Est. Cost</th><th>vs Prev</th>
       </tr></thead>
       <tbody id="billing-body"></tbody>
     </table>
     <div class="table-foot" id="billing-foot"></div>
+  </div>
+  <div class="table-card" id="sec-cache" data-card="cache-efficiency">
+    <div class="section-title"><span class="card-caret">&#9656;</span>Cache Efficiency <span class="info-icon" tabindex="0" role="img" aria-label="About this table" title="How much of each model's context was served from the prompt cache, and the estimated net saving vs paying the full input rate for those tokens (cache reads cost ~10% of input; cache writes cost ~25% more than input and are subtracted). Follows the model and date-range filters."><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg></span></div>
+    <table>
+      <thead><tr>
+        <th>Model</th><th>Uncached Input</th><th>Cache Read</th><th>Cache Creation</th>
+        <th>Hit Rate</th><th>Est. Net Savings</th>
+      </tr></thead>
+      <tbody id="cache-body"></tbody>
+    </table>
   </div>
   <div class="table-card" id="sec-cost-model" data-card="cost-by-model">
     <div class="section-title"><span class="card-caret">&#9656;</span>Cost by Model</div>
@@ -904,6 +971,9 @@ function fmt(n) {
 }
 function fmtCost(c)    { return '$' + c.toLocaleString(undefined, { minimumFractionDigits: 4, maximumFractionDigits: 4 }); }
 function fmtCostBig(c) { return '$' + c.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }); }
+// Savings can go negative (heavy cache writes, few reads) — keep the sign
+// outside the dollar amount so it doesn't read as "$-1.23".
+function fmtSaving(c)  { return (c < 0 ? '-' : '') + fmtCostBig(Math.abs(c)); }
 
 // ── Chart colors ───────────────────────────────────────────────────────────
 // Warm/neutral palette kept in sync with the CSS :root variables so charts match
@@ -1502,6 +1572,46 @@ function applyFilter() {
     (b.input + b.output + b.cache_read + b.cache_creation) -
     (a.input + a.output + a.cache_read + a.cache_creation));
 
+  // Tool usage (filtered by range + model). Counts turns whose assistant
+  // response led with each tool; text-only turns land in '(no tool)'.
+  const toolMap = {};
+  for (const r of (rawData.tool_daily || [])) {
+    if (!selectedModels.has(r.model)) continue;
+    if (start && r.day < start) continue;
+    if (end && r.day > end) continue;
+    toolMap[r.tool] = (toolMap[r.tool] || 0) + r.turns;
+  }
+  let byTool = Object.entries(toolMap).map(([tool, turns]) => ({ tool, turns }))
+    .sort((a, b) => b.turns - a.turns);
+  // Cap the bars; MCP servers can register dozens of rarely-used tools.
+  if (byTool.length > 15) {
+    const rest = byTool.slice(14).reduce((s, t) => s + t.turns, 0);
+    byTool = byTool.slice(0, 14);
+    byTool.push({ tool: '(other tools)', turns: rest });
+  }
+
+  // Cache efficiency per model (filtered by range + model). Net savings vs a
+  // no-caching world where every cached token would have been billed at the
+  // input rate: reads save (input − cache_read) per token, writes cost extra
+  // (cache_write − input). Priced per dated daily row (date-aware pricing).
+  const cacheMap = {};
+  for (const r of filteredDaily) {
+    if (!cacheMap[r.model]) cacheMap[r.model] = { model: r.model, input: 0, cache_read: 0, cache_creation: 0, savings: 0, billable: isBillable(r.model) };
+    const c = cacheMap[r.model];
+    c.input          += r.input;
+    c.cache_read     += r.cache_read;
+    c.cache_creation += r.cache_creation;
+    const p = isBillable(r.model) ? getPricing(r.model, r.day) : null;
+    if (p) {
+      c.savings += (r.cache_read     * (p.input - p.cache_read)
+                  - r.cache_creation * (p.cache_write - p.input)) / 1e6;
+    }
+  }
+  const byCache = Object.values(cacheMap)
+    .filter(c => c.input + c.cache_read + c.cache_creation > 0)
+    .sort((a, b) => b.cache_read - a.cache_read);
+  totals.cache_savings = byCache.reduce((s, c) => s + c.savings, 0);
+
   // Top dispatches: filter by range + selected model. Keep the full filtered set
   // (already ranked by tokens server-side) so the table can page it like Recent
   // Sessions — show more/less plus CSV export of everything.
@@ -1517,6 +1627,7 @@ function applyFilter() {
   document.getElementById('daily-chart-title').textContent = 'Daily Token Usage \u2014 ' + titleLabel;
   document.getElementById('hourly-chart-title').textContent = 'Average Hourly Distribution \u2014 ' + titleLabel;
   document.getElementById('subagent-chart-title').textContent = 'Subagent Tokens by Type \u2014 ' + titleLabel;
+  document.getElementById('tools-chart-title').textContent = 'Turns by Tool \u2014 ' + titleLabel;
 
   renderStats(totals);
   renderDailyChart(daily);
@@ -1524,6 +1635,9 @@ function applyFilter() {
   renderModelChart(byModel);
   renderProjectChart(byProject);
   renderSubagentChart(byAgentType);
+  renderToolsChart(byTool);
+  renderHeatmap();
+  renderCacheTable(byCache);
   lastFilteredDispatches = filteredDispatches;
   renderTopDispatches(lastFilteredDispatches);
   lastFilteredSessions = sortSessions(filteredSessions);
@@ -1560,18 +1674,34 @@ function computeBillingCycles() {
     c.cache_creation += r.cache_creation;
     c.cost           += calcCost(r.model, r.input, r.output, r.cache_read, r.cache_creation, r.day);
   }
+  // Cost delta vs the previous cycle (null when there is no meaningful base).
+  // The current cycle's delta compares a partial month against a full one —
+  // flagged in the UI rather than suppressed.
+  for (let i = 1; i < cycles.length; i++) {
+    cycles[i].costDelta = cycles[i - 1].cost > 0
+      ? (cycles[i].cost - cycles[i - 1].cost) / cycles[i - 1].cost
+      : null;
+  }
   return cycles.reverse();  // newest first
+}
+
+function deltaCellHTML(delta, partial) {
+  if (delta == null) return '<td class="muted">—</td>';
+  const up = delta >= 0;
+  const cls = up ? 'delta-up' : 'delta-down';
+  const title = partial ? ' title="Current cycle is still in progress — compares a partial cycle against the full previous one"' : '';
+  return `<td class="num ${cls}"${title}>${up ? '▲' : '▼'} ${Math.abs(delta * 100).toFixed(0)}%${partial ? '<span class="muted">*</span>' : ''}</td>`;
 }
 
 function renderBillingCycles(rows) {
   const body = document.getElementById('billing-body');
   if (!subscriptionStart) {
-    body.innerHTML = '<tr><td colspan="8" class="muted" style="text-align:center;padding:24px">Set a subscription start date (Sub Start, in the filter bar) to break usage into monthly billing cycles.</td></tr>';
+    body.innerHTML = '<tr><td colspan="9" class="muted" style="text-align:center;padding:24px">Set a subscription start date (Sub Start, in the filter bar) to break usage into monthly billing cycles.</td></tr>';
     renderTableToggle('billing-foot', 0, cyclesLimit, 'lessCycleRows', 'moreCycleRows', 'exportCyclesCSV');
     return;
   }
   if (!rows.length) {
-    body.innerHTML = '<tr><td colspan="8" class="muted" style="text-align:center;padding:24px">No billing cycles yet — the subscription start date is in the future.</td></tr>';
+    body.innerHTML = '<tr><td colspan="9" class="muted" style="text-align:center;padding:24px">No billing cycles yet — the subscription start date is in the future.</td></tr>';
     renderTableToggle('billing-foot', 0, cyclesLimit, 'lessCycleRows', 'moreCycleRows', 'exportCyclesCSV');
     return;
   }
@@ -1587,6 +1717,7 @@ function renderBillingCycles(rows) {
       <td class="num">${animNum(k + 'cr', c.cache_read, 'tok')}</td>
       <td class="num">${animNum(k + 'cc', c.cache_creation, 'tok')}</td>
       <td class="cost">${animNum(k + 'cost', c.cost, 'cost')}</td>
+      ${deltaCellHTML(c.costDelta, c.current)}
     </tr>`;
   }).join('');
   runCellAnims('billing-body');
@@ -1626,6 +1757,7 @@ const ANIM_FMTS = {
   tok:  v => fmt(Math.round(v)),
   int:  v => Math.round(v).toLocaleString(),
   cost: v => fmtCost(v),
+  sav:  v => fmtSaving(v),
 };
 
 function animNum(key, raw, fmtName) {
@@ -1654,6 +1786,7 @@ function renderStats(t) {
     { label: 'Subagent Tokens', raw: t.subagent_tokens || 0, format: tokFmt,     sub: 'included in totals' },
     { label: 'Cache Read',      raw: t.cache_read,           format: tokFmt,     sub: 'from prompt cache' },
     { label: 'Cache Creation',  raw: t.cache_creation,       format: tokFmt,     sub: 'writes to prompt cache' },
+    { label: 'Cache Savings',   raw: t.cache_savings || 0,   format: fmtSaving,  sub: 'vs paying input rate', color: C.green },
     { label: 'Est. Cost',       raw: t.cost,                 format: fmtCostBig, sub: 'API pricing, June 2026', color: C.green },
   ];
   document.getElementById('stats-row').innerHTML = stats.map((s, i) => `
@@ -1915,6 +2048,144 @@ function renderSubagentChart(byType) {
       }
     }
   });
+}
+
+function renderToolsChart(byTool) {
+  const ctx = document.getElementById('chart-tools').getContext('2d');
+  if (charts.tools) charts.tools.destroy();
+  if (!byTool.length) { charts.tools = null; return; }
+  const total = byTool.reduce((s, t) => s + t.turns, 0);
+  // Single series: no legend needed (the title names it). Real tools get the
+  // standard bar blue; the non-tool buckets read as de-emphasized grey.
+  const isBucket = t => t.tool === '(no tool)' || t.tool === '(other tools)';
+  charts.tools = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels: byTool.map(t => t.tool),
+      datasets: [{
+        data: byTool.map(t => t.turns),
+        backgroundColor: byTool.map(t => isBucket(t) ? 'rgba(111,111,112,0.55)' : TOKEN_COLORS.input),
+        hoverBackgroundColor: byTool.map(t => isBucket(t) ? 'rgba(111,111,112,0.8)' : TOKEN_HOVER.input),
+      }]
+    },
+    options: {
+      indexAxis: 'y', responsive: true, maintainAspectRatio: false, resizeDelay: 150,
+      plugins: {
+        legend: { display: false },
+        tooltip: { callbacks: {
+          label: item => ` ${item.parsed.x.toLocaleString()} turns · ${(item.parsed.x / total * 100).toFixed(1)}%`
+        } }
+      },
+      scales: {
+        x: { ticks: { color: C.axis, callback: v => fmt(v) }, grid: { color: C.border } },
+        y: { ticks: { color: C.axis, font: { size: 11 } }, grid: { color: C.border } },
+      }
+    }
+  });
+}
+
+// ── Daily cost heatmap ─────────────────────────────────────────────────────
+// Fixed window (last 26 whole weeks, Mon-start) independent of the range
+// filter — the point is the long-term rhythm — but it follows the model
+// filter. Sequential single-hue ramp of the accent, scaled to the window's
+// busiest day.
+const HM_WEEKS = 26;
+const HM_COLORS = ['#242526', '#45322B', '#7A4A38', '#AC6247', '#D97757'];
+
+function renderHeatmap() {
+  const wrap = document.getElementById('heatmap-scroll');
+  if (!wrap) return;
+
+  // Cost + tokens per day across the window, for the selected models.
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const monday = new Date(today);
+  monday.setDate(monday.getDate() - ((today.getDay() + 6) % 7) - (HM_WEEKS - 1) * 7);
+  const startISO = localISODate(monday), todayISO = localISODate(today);
+  const byDay = {};
+  for (const r of rawData.daily_by_model) {
+    if (!selectedModels.has(r.model)) continue;
+    if (r.day < startISO || r.day > todayISO) continue;
+    if (!byDay[r.day]) byDay[r.day] = { cost: 0, tokens: 0 };
+    byDay[r.day].cost   += calcCost(r.model, r.input, r.output, r.cache_read, r.cache_creation, r.day);
+    byDay[r.day].tokens += r.input + r.output + r.cache_read + r.cache_creation;
+  }
+  const maxCost = Math.max(0, ...Object.values(byDay).map(d => d.cost));
+
+  const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  // Month labels: one span per month segment, sized in week-columns.
+  const monthSpans = [];
+  const cells = [];
+  const d = new Date(monday);
+  for (let w = 0; w < HM_WEEKS; w++) {
+    const m = d.getMonth();
+    if (!monthSpans.length || monthSpans[monthSpans.length - 1].m !== m) {
+      monthSpans.push({ m, weeks: 1 });
+    } else {
+      monthSpans[monthSpans.length - 1].weeks++;
+    }
+    for (let dow = 0; dow < 7; dow++) {
+      const iso = localISODate(d);
+      if (iso > todayISO) {
+        cells.push('<span class="hm-cell" style="visibility:hidden"></span>');
+      } else {
+        const v = byDay[iso];
+        const lv = !v || v.cost <= 0 ? 0
+          : maxCost > 0 ? Math.min(4, Math.max(1, Math.ceil(v.cost / maxCost * 4))) : 0;
+        const tip = iso + (v ? ' — ' + fmtCostBig(v.cost) + ' · ' + fmt(v.tokens) + ' tokens' : ' — no usage');
+        cells.push(`<span class="hm-cell" style="background:${HM_COLORS[lv]}" title="${esc(tip)}"></span>`);
+      }
+      d.setDate(d.getDate() + 1);
+    }
+  }
+  const monthHTML = monthSpans.map(s =>
+    `<span style="grid-column: span ${s.weeks}">${s.weeks >= 2 ? MONTHS[s.m] : ''}</span>`).join('');
+  const dayHTML = ['Mon','','Wed','','Fri','',''].map(l => `<span>${l}</span>`).join('');
+  wrap.innerHTML = `<div class="hm-flex">
+    <div><div class="hm-months" style="height:14px"></div><div class="hm-daylabels">${dayHTML}</div></div>
+    <div><div class="hm-months">${monthHTML}</div><div class="hm-cells">${cells.join('')}</div></div>
+  </div>`;
+
+  const legend = document.getElementById('heatmap-legend');
+  if (legend) {
+    legend.innerHTML = 'Less ' +
+      HM_COLORS.map(c => `<span class="hm-cell" style="background:${c}"></span>`).join('') +
+      ' More' + (maxCost > 0 ? ` · max ${fmtCostBig(maxCost)}/day` : '');
+  }
+}
+
+function renderCacheTable(byCache) {
+  const body = document.getElementById('cache-body');
+  if (!byCache.length) {
+    body.innerHTML = '<tr><td colspan="6" class="muted" style="text-align:center;padding:24px">No usage in selected range.</td></tr>';
+    return;
+  }
+  const t = { input: 0, cache_read: 0, cache_creation: 0, savings: 0, billable: false };
+  for (const c of byCache) {
+    t.input += c.input; t.cache_read += c.cache_read; t.cache_creation += c.cache_creation;
+    t.savings += c.savings; t.billable = t.billable || c.billable;
+  }
+  const hitRate = c => {
+    const ctx = c.input + c.cache_read;
+    return ctx > 0 ? (c.cache_read / ctx * 100).toFixed(1) + '%' : '—';
+  };
+  const savingsCell = c => {
+    if (!c.billable) return '<td class="cost-na">n/a</td>';
+    const k = 'ce|' + (c.model || 'total') + '|sav';
+    const cls = c.savings < 0 ? 'delta-up num' : 'cost';
+    return `<td class="${cls}">${animNum(k, c.savings, 'sav')}</td>`;
+  };
+  const row = (c, name, bold) => `<tr${bold ? ' style="font-weight:600"' : ''}>
+      <td>${bold ? esc(name) : '<span class="model-tag">' + esc(name) + '</span>'}</td>
+      <td class="num">${animNum('ce|' + name + '|in', c.input, 'tok')}</td>
+      <td class="num">${animNum('ce|' + name + '|cr', c.cache_read, 'tok')}</td>
+      <td class="num">${animNum('ce|' + name + '|cc', c.cache_creation, 'tok')}</td>
+      <td class="num">${hitRate(c)}</td>
+      ${savingsCell(c)}
+    </tr>`;
+  let html = byCache.map(c => row(c, c.model, false)).join('');
+  if (byCache.length > 1) html += row({ ...t, model: 'total' }, 'Total', true);
+  body.innerHTML = html;
+  runCellAnims('cache-body');
 }
 
 function renderTopDispatches(rows) {
@@ -2243,9 +2514,10 @@ function exportProjectBranchCSV() {
 }
 
 function exportCyclesCSV() {
-  const header = ['Cycle Start', 'Cycle End', 'Days', 'Turns', 'Input', 'Output', 'Cache Read', 'Cache Creation', 'Est. Cost'];
+  const header = ['Cycle Start', 'Cycle End', 'Days', 'Turns', 'Input', 'Output', 'Cache Read', 'Cache Creation', 'Est. Cost', 'Cost vs Prev (%)'];
   const rows = lastCycles.map(c => {
-    return [c.start, c.end, cycleDayCount(c), c.turns, c.input, c.output, c.cache_read, c.cache_creation, c.cost.toFixed(4)];
+    return [c.start, c.end, cycleDayCount(c), c.turns, c.input, c.output, c.cache_read, c.cache_creation, c.cost.toFixed(4),
+            c.costDelta == null ? '' : (c.costDelta * 100).toFixed(1)];
   });
   downloadCSV('billing_cycles', header, rows);
 }

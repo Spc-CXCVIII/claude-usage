@@ -76,6 +76,31 @@ class TestGetDashboardData(unittest.TestCase):
         self.assertEqual(session["model"], "claude-sonnet-4-6")
         self.assertEqual(session["input"], 5000)
 
+    def test_tool_daily_populated(self):
+        data = get_dashboard_data(db_path=self.db_path)
+        self.assertIn("tool_daily", data)
+        # Both seeded turns have tool_name=None -> the '(no tool)' bucket.
+        by_tool = {r["tool"]: r["turns"] for r in data["tool_daily"]}
+        self.assertEqual(by_tool.get("(no tool)"), 2)
+        row = data["tool_daily"][0]
+        self.assertEqual(row["day"], "2026-04-08")
+        self.assertEqual(row["model"], "claude-sonnet-4-6")
+
+    def test_tool_daily_groups_by_tool_name(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            """INSERT INTO turns (session_id, timestamp, model, input_tokens,
+               output_tokens, cache_read_tokens, cache_creation_tokens, tool_name, cwd)
+               VALUES ('sess-abc123', '2026-04-08T11:00:00Z', 'claude-sonnet-4-6',
+                       100, 50, 0, 0, 'Bash', '/tmp')"""
+        )
+        conn.commit()
+        conn.close()
+        data = get_dashboard_data(db_path=self.db_path)
+        by_tool = {r["tool"]: r["turns"] for r in data["tool_daily"]}
+        self.assertEqual(by_tool.get("Bash"), 1)
+        self.assertEqual(by_tool.get("(no tool)"), 2)
+
     def test_settings_default_to_no_subscription_start(self):
         data = get_dashboard_data(db_path=self.db_path)
         self.assertIn("settings", data)
