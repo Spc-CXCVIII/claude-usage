@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 from pathlib import Path
 from datetime import datetime
 
-from scanner import VERSION, init_db
+from scanner import VERSION, get_db, init_db
 
 DB_PATH = Path(os.environ.get("CLAUDE_USAGE_DB", Path.home() / ".claude" / "usage.db"))
 
@@ -256,9 +256,16 @@ def get_dashboard_data(db_path=DB_PATH):
         "status":         r["status"],
     } for r in top_dispatch_rows]
 
+    # ── User settings (persisted server-side, see POST /api/settings) ─────────
+    settings_rows = conn.execute("SELECT key, value FROM settings").fetchall()
+    settings = {r["key"]: r["value"] for r in settings_rows}
+
     conn.close()
 
     return {
+        "settings": {
+            "subscription_start": settings.get("subscription_start"),
+        },
         "all_models":      all_models,
         "daily_by_model":  daily_by_model,
         "hourly_by_model": hourly_by_model,
@@ -360,6 +367,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .range-select select:hover, .range-select select:focus { border-color: var(--accent); outline: none; }
   .range-select::after { content: "\25BE"; position: absolute; right: 11px; top: 50%; transform: translateY(-50%); color: var(--muted); font-size: 10px; pointer-events: none; }
   .range-select option { background: var(--card); color: var(--text); }
+  .range-select option:disabled { color: var(--muted); }
+  /* Subscription start date — same visual language as the range/model triggers.
+     color-scheme: dark keeps the native picker popup dark. */
+  .date-input { padding: 4px 9px; background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--text); font-size: 12px; font-family: inherit; color-scheme: dark; cursor: pointer; transition: border-color 0.15s; }
+  .date-input:hover, .date-input:focus { border-color: var(--accent); outline: none; }
+  .date-input::-webkit-calendar-picker-indicator { cursor: pointer; opacity: 0.6; }
+  .cycle-tag { display: inline-block; margin-left: 8px; padding: 1px 7px; border-radius: var(--radius-sm); font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; background: rgba(217,119,87,0.15); color: var(--accent); border: 1px solid rgba(217,119,87,0.35); }
 
   .container { max-width: 1400px; margin: 0 auto; padding: 24px; }
   /* Ledger strip, not a row of separate rounded cards: the 1px grid gap over a
@@ -523,8 +537,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <option value="30d">Last 30 Days</option>
       <option value="90d">Last 90 Days</option>
       <option value="all">All Time</option>
+      <option value="sub-month" id="opt-sub-month" disabled>Billing Month</option>
+      <option value="sub-prev-month" id="opt-sub-prev-month" disabled>Prev Billing Month</option>
     </select>
   </div>
+  <div class="filter-sep"></div>
+  <div class="filter-label">Sub Start</div>
+  <input type="date" id="sub-date-input" class="date-input" aria-label="Subscription start date"
+         onchange="onSubDateChange(this.value)"
+         title="Subscription start date — saved on the server, so it's remembered across restarts. Enables the Billing Month ranges and the Billing Cycles table (cycles run from this day of the month to the day before it in the next month).">
 </div>
 
 <nav id="jump-bar" aria-label="Jump to section">
@@ -548,6 +569,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       Tables <span class="jump-caret">&#9662;</span>
     </button>
     <div class="jump-panel">
+      <button class="jump-link" data-target="sec-billing">Billing Cycles</button>
       <button class="jump-link" data-target="sec-cost-model">Cost by Model</button>
       <button class="jump-link" data-target="sec-dispatches">Dispatches</button>
       <button class="jump-link" data-target="sec-sessions">Sessions</button>
@@ -590,6 +612,17 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <h2><span class="card-caret">&#9656;</span><span id="subagent-chart-title">Subagent Tokens by Type</span></h2>
       <div class="chart-wrap"><canvas id="chart-subagent"></canvas></div>
     </div>
+  </div>
+  <div class="table-card" id="sec-billing" data-card="billing-cycles">
+    <div class="section-header"><div class="section-title"><span class="card-caret">&#9656;</span>Billing Cycles <span class="info-icon" tabindex="0" role="img" aria-label="About this table" title="One row per subscription month, anchored on the Sub Start day — e.g. a June 22 start bills the 22nd of each month through the 21st of the next. Respects the model filter; ignores the date-range filter."><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg></span></div><button class="export-btn" onclick="exportCyclesCSV()" title="Export all billing cycles to CSV">&#x2913; CSV</button></div>
+    <table>
+      <thead><tr>
+        <th>Cycle</th><th>Days</th><th>Turns</th><th>Input</th><th>Output</th>
+        <th>Cache Read</th><th>Cache Creation</th><th>Est. Cost</th>
+      </tr></thead>
+      <tbody id="billing-body"></tbody>
+    </table>
+    <div class="table-foot" id="billing-foot"></div>
   </div>
   <div class="table-card" id="sec-cost-model" data-card="cost-by-model">
     <div class="section-title"><span class="card-caret">&#9656;</span>Cost by Model</div>
@@ -711,6 +744,10 @@ let lastByProject = [];
 let lastByProjectBranch = [];
 let lastFilteredDispatches = [];
 let sessionSortDir = 'desc';
+// Subscription start date ('YYYY-MM-DD' or null). Loaded from /api/data's
+// settings block (persisted server-side in the DB), saved via POST /api/settings.
+let subscriptionStart = null;
+let lastCycles = [];
 
 // Tables reveal rows in steps: 10 -> 25 -> 50, capped at 50 because rendering
 // more than that visibly hurts performance. Past 50 the footer offers a
@@ -740,6 +777,7 @@ let sessionsLimit = TABLE_STEPS[0];
 let projectLimit = TABLE_STEPS[0];
 let branchLimit = TABLE_STEPS[0];
 let dispatchesLimit = TABLE_STEPS[0];
+let cyclesLimit = TABLE_STEPS[0];
 let hourlyTZ = 'local';  // 'local' or 'utc'
 
 // ── Peak-hour config ───────────────────────────────────────────────────────
@@ -959,8 +997,8 @@ function legendToggle(key) {
 }
 
 // ── Time range ─────────────────────────────────────────────────────────────
-const RANGE_LABELS = { 'today': 'Today', 'week': 'This Week', 'month': 'This Month', 'prev-month': 'Previous Month', '7d': 'Last 7 Days', '30d': 'Last 30 Days', '90d': 'Last 90 Days', 'all': 'All Time' };
-const RANGE_TICKS  = { 'today': 1, 'week': 7, 'month': 15, 'prev-month': 15, '7d': 7, '30d': 15, '90d': 13, 'all': 12 };
+const RANGE_LABELS = { 'today': 'Today', 'week': 'This Week', 'month': 'This Month', 'prev-month': 'Previous Month', '7d': 'Last 7 Days', '30d': 'Last 30 Days', '90d': 'Last 90 Days', 'all': 'All Time', 'sub-month': 'Billing Month', 'sub-prev-month': 'Prev Billing Month' };
+const RANGE_TICKS  = { 'today': 1, 'week': 7, 'month': 15, 'prev-month': 15, '7d': 7, '30d': 15, '90d': 13, 'all': 12, 'sub-month': 15, 'sub-prev-month': 15 };
 const VALID_RANGES = Object.keys(RANGE_LABELS);
 
 // Local calendar date as YYYY-MM-DD. NOT toISOString(), which formats in UTC and
@@ -978,8 +1016,70 @@ function rangeIncludesToday(range) {
   return true;
 }
 
+// ── Subscription billing cycles ────────────────────────────────────────────
+// Cycles are anchored on the subscription start's day-of-month: a June 22 start
+// bills 22nd → 21st of the next month. When a month is too short for the anchor
+// day (e.g. anchor 31 in February), the cycle starts on that month's last day —
+// the same clamping subscription billing systems use.
+function parseISODate(s) {
+  const [y, m, d] = s.split('-').map(Number);
+  return new Date(y, m - 1, d);
+}
+
+// Anchor date for a (year, month) pair; month may fall outside 0–11, the Date
+// constructor normalizes it (e.g. month -1 = December of the previous year).
+function clampedAnchor(y, m, anchorDay) {
+  const daysInMonth = new Date(y, m + 1, 0).getDate();
+  return new Date(y, m, Math.min(anchorDay, daysInMonth));
+}
+
+// Bounds of the cycle containing today (offset 0) or a neighbor (offset -1 =
+// previous cycle). The start never precedes the subscription date itself.
+function subCycleBounds(subISO, offset) {
+  const sub = parseISODate(subISO);
+  const anchorDay = sub.getDate();
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  let y = today.getFullYear(), m = today.getMonth();
+  if (clampedAnchor(y, m, anchorDay) > today) m -= 1;
+  m += offset;
+  let start = clampedAnchor(y, m, anchorDay);
+  const end = clampedAnchor(y, m + 1, anchorDay);
+  end.setDate(end.getDate() - 1);
+  if (start < sub) start = sub;
+  return { start: localISODate(start), end: localISODate(end) };
+}
+
+// Every cycle from the subscription date through today, oldest first.
+function listSubCycles(subISO) {
+  const sub = parseISODate(subISO);
+  const anchorDay = sub.getDate();
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const todayISO = localISODate(today);
+  const cycles = [];
+  let start = sub;
+  let y = sub.getFullYear(), m = sub.getMonth();
+  // Hard cap of 240 cycles (20 years) guards against a mistyped ancient date.
+  while (start <= today && cycles.length < 240) {
+    const next = clampedAnchor(y, m + 1, anchorDay);
+    const end = new Date(next); end.setDate(end.getDate() - 1);
+    const startISO = localISODate(start), endISO = localISODate(end);
+    cycles.push({ start: startISO, end: endISO, current: startISO <= todayISO && todayISO <= endISO });
+    start = next;
+    m += 1;
+  }
+  return cycles;
+}
+
+function cycleDayCount(c) {
+  return Math.round((parseISODate(c.end) - parseISODate(c.start)) / 86400000) + 1;
+}
+
 function getRangeBounds(range) {
   if (range === 'all') return { start: null, end: null };
+  if (range === 'sub-month' || range === 'sub-prev-month') {
+    if (!subscriptionStart) return { start: null, end: null };
+    return subCycleBounds(subscriptionStart, range === 'sub-month' ? 0 : -1);
+  }
   const today = new Date();
   const iso = localISODate;
   if (range === 'today') {
@@ -1011,7 +1111,46 @@ function getRangeBounds(range) {
 
 function readURLRange() {
   const p = new URLSearchParams(window.location.search).get('range');
-  return VALID_RANGES.includes(p) ? p : '30d';
+  if (!VALID_RANGES.includes(p)) return '30d';
+  // Subscription-anchored ranges are meaningless without a subscription date.
+  if ((p === 'sub-month' || p === 'sub-prev-month') && !subscriptionStart) return '30d';
+  return p;
+}
+
+// ── Subscription start date ────────────────────────────────────────────────
+function updateSubRangeOptions() {
+  ['sub-month', 'sub-prev-month'].forEach(id => {
+    const opt = document.getElementById('opt-' + id);
+    if (opt) opt.disabled = !subscriptionStart;
+  });
+}
+
+// Reflect a subscription date (from the server or the picker) into UI state.
+function applySubscriptionStart(v) {
+  subscriptionStart = v || null;
+  const input = document.getElementById('sub-date-input');
+  if (input && input.value !== (subscriptionStart || '')) input.value = subscriptionStart || '';
+  updateSubRangeOptions();
+  if (!subscriptionStart && (selectedRange === 'sub-month' || selectedRange === 'sub-prev-month')) {
+    setRange('30d');  // the anchored range just lost its anchor
+  } else {
+    applyFilter();
+  }
+}
+
+async function onSubDateChange(value) {
+  try {
+    const resp = await fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ subscription_start: value || null }),
+    });
+    const d = await resp.json();
+    if (d.error) { console.error(d.error); return; }
+    applySubscriptionStart(d.settings.subscription_start);
+  } catch (e) {
+    console.error(e);
+  }
 }
 
 function setRange(range) {
@@ -1370,10 +1509,14 @@ function applyFilter() {
     selectedModels.has(d.model) && (!start || d.start_date >= start) && (!end || d.start_date <= end)
   );
 
-  // Update daily chart title
-  document.getElementById('daily-chart-title').textContent = 'Daily Token Usage \u2014 ' + RANGE_LABELS[selectedRange];
-  document.getElementById('hourly-chart-title').textContent = 'Average Hourly Distribution \u2014 ' + RANGE_LABELS[selectedRange];
-  document.getElementById('subagent-chart-title').textContent = 'Subagent Tokens by Type \u2014 ' + RANGE_LABELS[selectedRange];
+  // Update chart titles. Subscription-anchored ranges include their concrete
+  // bounds so the user can see exactly which cycle is being shown.
+  const titleLabel = (selectedRange === 'sub-month' || selectedRange === 'sub-prev-month') && start && end
+    ? RANGE_LABELS[selectedRange] + ' (' + start + ' \u2192 ' + end + ')'
+    : RANGE_LABELS[selectedRange];
+  document.getElementById('daily-chart-title').textContent = 'Daily Token Usage \u2014 ' + titleLabel;
+  document.getElementById('hourly-chart-title').textContent = 'Average Hourly Distribution \u2014 ' + titleLabel;
+  document.getElementById('subagent-chart-title').textContent = 'Subagent Tokens by Type \u2014 ' + titleLabel;
 
   renderStats(totals);
   renderDailyChart(daily);
@@ -1391,6 +1534,63 @@ function applyFilter() {
   renderModelCostTable(lastByModel);
   renderProjectCostTable(lastByProject);
   renderProjectBranchCostTable(lastByProjectBranch);
+  lastCycles = computeBillingCycles();
+  renderBillingCycles(lastCycles);
+}
+
+// ── Billing cycles table ───────────────────────────────────────────────────
+// One row per subscription month since the start date. Respects the model
+// filter but not the date-range filter — the whole point is seeing every cycle
+// side by side. Costs accumulate per dated daily row (date-aware pricing).
+function computeBillingCycles() {
+  if (!subscriptionStart || !rawData) return [];
+  const cycles = listSubCycles(subscriptionStart).map(c => ({
+    ...c, turns: 0, input: 0, output: 0, cache_read: 0, cache_creation: 0, cost: 0,
+  }));
+  if (!cycles.length) return [];
+  for (const r of rawData.daily_by_model) {
+    if (!selectedModels.has(r.model)) continue;
+    if (r.day < cycles[0].start || r.day > cycles[cycles.length - 1].end) continue;
+    const c = cycles.find(c => r.day >= c.start && r.day <= c.end);
+    if (!c) continue;
+    c.turns          += r.turns;
+    c.input          += r.input;
+    c.output         += r.output;
+    c.cache_read     += r.cache_read;
+    c.cache_creation += r.cache_creation;
+    c.cost           += calcCost(r.model, r.input, r.output, r.cache_read, r.cache_creation, r.day);
+  }
+  return cycles.reverse();  // newest first
+}
+
+function renderBillingCycles(rows) {
+  const body = document.getElementById('billing-body');
+  if (!subscriptionStart) {
+    body.innerHTML = '<tr><td colspan="8" class="muted" style="text-align:center;padding:24px">Set a subscription start date (Sub Start, in the filter bar) to break usage into monthly billing cycles.</td></tr>';
+    renderTableToggle('billing-foot', 0, cyclesLimit, 'lessCycleRows', 'moreCycleRows', 'exportCyclesCSV');
+    return;
+  }
+  if (!rows.length) {
+    body.innerHTML = '<tr><td colspan="8" class="muted" style="text-align:center;padding:24px">No billing cycles yet — the subscription start date is in the future.</td></tr>';
+    renderTableToggle('billing-foot', 0, cyclesLimit, 'lessCycleRows', 'moreCycleRows', 'exportCyclesCSV');
+    return;
+  }
+  const shown = rows.slice(0, shownCount(cyclesLimit, rows.length));
+  body.innerHTML = shown.map(c => {
+    const k = 'cy|' + c.start + '|';
+    return `<tr>
+      <td class="num">${esc(c.start)} → ${esc(c.end)}${c.current ? '<span class="cycle-tag">current</span>' : ''}</td>
+      <td class="muted">${cycleDayCount(c)}</td>
+      <td class="num">${animNum(k + 'turns', c.turns, 'int')}</td>
+      <td class="num">${animNum(k + 'input', c.input, 'tok')}</td>
+      <td class="num">${animNum(k + 'output', c.output, 'tok')}</td>
+      <td class="num">${animNum(k + 'cr', c.cache_read, 'tok')}</td>
+      <td class="num">${animNum(k + 'cc', c.cache_creation, 'tok')}</td>
+      <td class="cost">${animNum(k + 'cost', c.cost, 'cost')}</td>
+    </tr>`;
+  }).join('');
+  runCellAnims('billing-body');
+  renderTableToggle('billing-foot', rows.length, cyclesLimit, 'lessCycleRows', 'moreCycleRows', 'exportCyclesCSV');
 }
 
 // ── Renderers ──────────────────────────────────────────────────────────────
@@ -1796,6 +1996,8 @@ function moreBranchRows()  { branchLimit   = nextTableLimit(branchLimit,   lastB
 function lessBranchRows()  { branchLimit   = TABLE_STEPS[0]; renderProjectBranchCostTable(lastByProjectBranch); scrollTableToTop('project-branch-cost-body'); }
 function moreDispatchRows(){ dispatchesLimit = nextTableLimit(dispatchesLimit, lastFilteredDispatches.length); renderTopDispatches(lastFilteredDispatches); }
 function lessDispatchRows(){ dispatchesLimit = TABLE_STEPS[0]; renderTopDispatches(lastFilteredDispatches);            scrollTableToTop('dispatches-body'); }
+function moreCycleRows()   { cyclesLimit    = nextTableLimit(cyclesLimit,    lastCycles.length);              renderBillingCycles(lastCycles); }
+function lessCycleRows()   { cyclesLimit    = TABLE_STEPS[0]; renderBillingCycles(lastCycles);                   scrollTableToTop('billing-body'); }
 
 function renderSessionsTable(sessions) {
   const shown = sessions.slice(0, shownCount(sessionsLimit, sessions.length));
@@ -2040,6 +2242,14 @@ function exportProjectBranchCSV() {
   downloadCSV('projects_by_branch', header, rows);
 }
 
+function exportCyclesCSV() {
+  const header = ['Cycle Start', 'Cycle End', 'Days', 'Turns', 'Input', 'Output', 'Cache Read', 'Cache Creation', 'Est. Cost'];
+  const rows = lastCycles.map(c => {
+    return [c.start, c.end, cycleDayCount(c), c.turns, c.input, c.output, c.cache_read, c.cache_creation, c.cost.toFixed(4)];
+  });
+  downloadCSV('billing_cycles', header, rows);
+}
+
 function exportDispatchesCSV() {
   const header = ['Type', 'Agent ID', 'Started', 'Model', 'Turns', 'Tool Uses', 'Duration (ms)', 'Input', 'Output', 'Cache Read', 'Cache Creation', 'Total Tokens', 'Est. Cost', 'Status'];
   const rows = lastFilteredDispatches.map(d => {
@@ -2104,6 +2314,12 @@ async function loadData() {
     rawData = d;
 
     if (isFirstLoad) {
+      // Server-persisted settings must land before readURLRange — a
+      // range=sub-month URL is only honored when a subscription date exists.
+      subscriptionStart = (d.settings && d.settings.subscription_start) || null;
+      const subInput = document.getElementById('sub-date-input');
+      if (subInput) subInput.value = subscriptionStart || '';
+      updateSubRangeOptions();
       // Restore range from URL into the dropdown
       selectedRange = readURLRange();
       const rangeSel = document.getElementById('range-select');
@@ -2118,6 +2334,16 @@ async function loadData() {
       updateModelSortIcons();
       updateProjectSortIcons();
       updateProjectBranchSortIcons();
+    }
+
+    if (!isFirstLoad) {
+      // Another tab / surface may have changed the subscription date; adopt it
+      // unless this tab's picker is being edited right now.
+      const serverSub = (d.settings && d.settings.subscription_start) || null;
+      if (serverSub !== subscriptionStart && document.activeElement !== document.getElementById('sub-date-input')) {
+        applySubscriptionStart(serverSub);  // re-syncs the picker + re-renders
+        return;
+      }
     }
 
     applyFilter();
@@ -2457,6 +2683,60 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+        elif path == "/api/settings":
+            # Persist user settings (currently just subscription_start) in the
+            # DB's `settings` table, so the choice survives server restarts and
+            # isn't tied to a browser origin like localStorage would be.
+            # Body: {"subscription_start": "YYYY-MM-DD"} — null/"" clears it.
+            length = int(self.headers.get("Content-Length") or 0)
+            try:
+                payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+            except (ValueError, UnicodeDecodeError):
+                payload = None
+            if not isinstance(payload, dict) or "subscription_start" not in payload:
+                body = json.dumps({"error": "expected JSON body with subscription_start"}).encode("utf-8")
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            value = payload["subscription_start"]
+            if value:
+                try:
+                    datetime.strptime(str(value), "%Y-%m-%d")
+                except ValueError:
+                    body = json.dumps({"error": "subscription_start must be YYYY-MM-DD"}).encode("utf-8")
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+            # get_db creates the parent dir + DB on a fresh install; init_db
+            # ensures the settings table exists before the first scan runs.
+            conn = get_db(DB_PATH)
+            init_db(conn)
+            if value:
+                conn.execute(
+                    "INSERT OR REPLACE INTO settings (key, value) VALUES ('subscription_start', ?)",
+                    (str(value),),
+                )
+            else:
+                conn.execute("DELETE FROM settings WHERE key = 'subscription_start'")
+            conn.commit()
+            conn.close()
+            body = json.dumps({
+                "ok": True,
+                "settings": {"subscription_start": str(value) if value else None},
+            }).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         else:
             self.send_response(404)
             self.end_headers()

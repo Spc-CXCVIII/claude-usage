@@ -76,6 +76,21 @@ class TestGetDashboardData(unittest.TestCase):
         self.assertEqual(session["model"], "claude-sonnet-4-6")
         self.assertEqual(session["input"], 5000)
 
+    def test_settings_default_to_no_subscription_start(self):
+        data = get_dashboard_data(db_path=self.db_path)
+        self.assertIn("settings", data)
+        self.assertIsNone(data["settings"]["subscription_start"])
+
+    def test_settings_subscription_start_returned_when_set(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('subscription_start', '2026-06-22')"
+        )
+        conn.commit()
+        conn.close()
+        data = get_dashboard_data(db_path=self.db_path)
+        self.assertEqual(data["settings"]["subscription_start"], "2026-06-22")
+
     def test_daily_by_model_populated(self):
         data = get_dashboard_data(db_path=self.db_path)
         self.assertGreater(len(data["daily_by_model"]), 0)
@@ -376,6 +391,49 @@ class TestDashboardHTTP(unittest.TestCase):
             conn.close()
         self.assertEqual(turn_count, 1, "rescan must not delete existing turns")
         self.assertEqual(sess_count, 1, "rescan must not delete existing sessions")
+
+    def _post_settings(self, payload):
+        url = f"http://127.0.0.1:{self.port}/api/settings"
+        req = urllib.request.Request(
+            url, method="POST", data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req) as resp:
+            return resp.status, json.loads(resp.read())
+
+    def test_api_settings_persists_subscription_start(self):
+        # Save → visible via /api/data → clear → gone again. Leaves the shared
+        # class DB in its default state for the other tests.
+        status, body = self._post_settings({"subscription_start": "2026-06-22"})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["settings"]["subscription_start"], "2026-06-22")
+
+        with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/api/data") as resp:
+            data = json.loads(resp.read())
+        self.assertEqual(data["settings"]["subscription_start"], "2026-06-22")
+
+        status, body = self._post_settings({"subscription_start": None})
+        self.assertEqual(status, 200)
+        self.assertIsNone(body["settings"]["subscription_start"])
+
+        with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/api/data") as resp:
+            data = json.loads(resp.read())
+        self.assertIsNone(data["settings"]["subscription_start"])
+
+    def test_api_settings_rejects_invalid_date(self):
+        for bad in ("22-06-2026", "2026-13-01", "not-a-date"):
+            try:
+                self._post_settings({"subscription_start": bad})
+                self.fail(f"Expected 400 for {bad!r}")
+            except urllib.error.HTTPError as e:
+                self.assertEqual(e.code, 400)
+
+    def test_api_settings_rejects_missing_key(self):
+        try:
+            self._post_settings({"something_else": True})
+            self.fail("Expected 400 for a body without subscription_start")
+        except urllib.error.HTTPError as e:
+            self.assertEqual(e.code, 400)
 
     def test_404_for_unknown_path(self):
         url = f"http://127.0.0.1:{self.port}/nonexistent"
