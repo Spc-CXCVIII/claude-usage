@@ -166,7 +166,11 @@ def get_dashboard_data(db_path=DB_PATH):
             session_id, project_name, first_timestamp, last_timestamp,
             total_input_tokens, total_output_tokens,
             total_cache_read, total_cache_creation, model, turn_count,
-            git_branch, topic
+            git_branch, topic,
+            (SELECT t.cwd FROM turns t
+             WHERE t.session_id = sessions.session_id
+               AND t.cwd IS NOT NULL AND t.cwd != ''
+             ORDER BY t.timestamp DESC LIMIT 1) AS cwd
         FROM sessions
         ORDER BY last_timestamp DESC
     """).fetchall()
@@ -183,6 +187,7 @@ def get_dashboard_data(db_path=DB_PATH):
             # Full id: the table truncates for display, but the CSV export
             # needs the whole thing (an 8-char prefix isn't uniquely useful).
             "session_id":    r["session_id"],
+            "cwd":           r["cwd"] or "",
             "project":       r["project_name"] or "unknown",
             "branch":        r["git_branch"] or "",
             "topic":         r["topic"] or "",
@@ -466,6 +471,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .num { font-family: var(--font-mono); }
   .muted { color: var(--muted); }
   .topic-cell { box-sizing: border-box; min-width: 160px; max-width: 260px; overflow-wrap: anywhere; font-size: 12px; color: var(--text); }
+  tr.session-row { cursor: pointer; }
+  #copy-toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%) translateY(8px); background: var(--card); border: 1px solid var(--accent); color: var(--text); padding: 10px 16px; border-radius: var(--radius-sm); font-family: var(--font-mono); font-size: 12px; opacity: 0; pointer-events: none; transition: opacity 0.2s, transform 0.2s; z-index: 1000; max-width: 80vw; overflow-wrap: anywhere; box-shadow: 0 4px 16px rgba(0,0,0,0.3); }
+  #copy-toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
   .untitled { color: var(--muted); font-style: italic; }
   .section-title { font-size: 13px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 12px; }
   .section-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
@@ -790,6 +798,12 @@ function esc(s) {
   const d = document.createElement('div');
   d.textContent = String(s);
   return d.innerHTML;
+}
+
+// esc() covers text nodes but not quotes; needed when interpolating into
+// HTML attribute values (e.g. data-cwd on session rows).
+function escAttr(s) {
+  return esc(s).replace(/"/g, '&quot;');
 }
 
 // ── State ──────────────────────────────────────────────────────────────────
@@ -2281,7 +2295,7 @@ function renderSessionsTable(sessions) {
     const titleCell = s.topic
       ? `<td class="topic-cell" title="${esc(s.topic)}">${esc(s.topic)}</td>`
       : `<td class="topic-cell"><span class="untitled">Untitled</span></td>`;
-    return `<tr>
+    return `<tr class="session-row" data-sid="${escAttr(s.session_id)}" data-cwd="${escAttr(s.cwd || '')}" onclick="copySessionResume(this)" title="Click to copy: cd to project + claude --resume">
       <td class="muted" style="font-family:monospace">${esc(s.session_id.slice(0, 8))}&hellip;</td>
       <td>${esc(s.project)}</td>
       ${titleCell}
@@ -2296,6 +2310,47 @@ function renderSessionsTable(sessions) {
   }).join('');
   runCellAnims('sessions-body');
   renderTableToggle('sessions-foot', sessions.length, sessionsLimit, 'lessSessionRows', 'moreSessionRows', 'exportSessionsCSV');
+}
+
+// Row click on Recent Sessions: copy a shell command that jumps to the
+// session's working directory and resumes it in Claude Code.
+function copySessionResume(row) {
+  const sid = row.dataset.sid || '';
+  const cwd = row.dataset.cwd || '';
+  const cmd = (cwd ? 'cd "' + cwd + '" && ' : '') + 'claude --resume ' + sid;
+  copyTextToClipboard(cmd).then(ok =>
+    showCopyToast(ok ? 'Copied: ' + cmd : 'Copy failed — ' + cmd));
+}
+
+function copyTextToClipboard(text) {
+  // navigator.clipboard needs a secure context (localhost qualifies); fall
+  // back to the textarea/execCommand trick for e.g. LAN-hosted dashboards.
+  if (navigator.clipboard && window.isSecureContext) {
+    return navigator.clipboard.writeText(text).then(() => true, () => legacyCopy(text));
+  }
+  return Promise.resolve(legacyCopy(text));
+}
+
+function legacyCopy(text) {
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed';
+  ta.style.opacity = '0';
+  document.body.appendChild(ta);
+  ta.select();
+  let ok = false;
+  try { ok = document.execCommand('copy'); } catch (e) {}
+  ta.remove();
+  return ok;
+}
+
+let copyToastTimer = null;
+function showCopyToast(msg) {
+  const el = document.getElementById('copy-toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  clearTimeout(copyToastTimer);
+  copyToastTimer = setTimeout(() => el.classList.remove('show'), 3000);
 }
 
 function setModelSort(col) {
@@ -2849,6 +2904,7 @@ initSectionNav();
 loadData();
 scheduleAutoRefresh();
 </script>
+<div id="copy-toast" role="status" aria-live="polite"></div>
 </body>
 </html>
 """
