@@ -1046,6 +1046,20 @@ function fmtDuration(ms) {
   return `${h}h${m % 60}m`;
 }
 
+// Session durations can span days (resumed sessions), so show the largest
+// applicable units instead of raw minutes (e.g. "2d 3h 15m" not "3195m").
+function fmtDurationMin(totalMin) {
+  let min = Math.round(totalMin) || 0;
+  if (min < 60) return `${min}m`;
+  const d = Math.floor(min / 1440); min %= 1440;
+  const h = Math.floor(min / 60);   min %= 60;
+  const parts = [];
+  if (d) parts.push(`${d}d`);
+  if (d || h) parts.push(`${h}h`);
+  parts.push(`${min}m`);
+  return parts.join(' ');
+}
+
 // Tooltip color swatches: solid fill, no border (Chart.js's default draws a
 // bordered box that looked offset/inconsistent). Lines use their solid stroke
 // color instead of the translucent area fill.
@@ -1704,7 +1718,7 @@ function deltaCellHTML(delta, partial) {
   const up = delta >= 0;
   const cls = up ? 'delta-up' : 'delta-down';
   const title = partial ? ' title="Current cycle is still in progress — compares a partial cycle against the full previous one"' : '';
-  return `<td class="num ${cls}"${title}>${up ? '▲' : '▼'} ${Math.abs(delta * 100).toFixed(0)}%${partial ? '<span class="muted">*</span>' : ''}</td>`;
+  return `<td class="num ${cls}"${title}>${up ? '▲' : '▼'} ${Math.abs(delta * 100).toFixed(2)}%${partial ? '<span class="muted">*</span>' : ''}</td>`;
 }
 
 function renderBillingCycles(rows) {
@@ -2300,7 +2314,7 @@ function renderSessionsTable(sessions) {
       <td>${esc(s.project)}</td>
       ${titleCell}
       <td class="muted">${esc(s.last)}</td>
-      <td class="muted">${esc(s.duration_min)}m</td>
+      <td class="muted">${fmtDurationMin(s.duration_min)}</td>
       <td><span class="model-tag">${esc(s.model)}</span></td>
       <td class="num">${animNum(k + 'turns', s.turns, 'int')}</td>
       <td class="num">${animNum(k + 'input', s.input, 'tok')}</td>
