@@ -538,8 +538,10 @@ class TestHTMLTemplate(unittest.TestCase):
         """The GitHub update check and the extension promo are web-only: both
         guard on surface !== 'vscode' so the embedded panel stays quiet."""
         self.assertIn("APP_CONFIG.surface !== 'vscode'", HTML_TEMPLATE)
-        # The update check hits GitHub's public releases API, not any usage data.
-        self.assertIn("api.github.com/repos/phuryn/claude-usage/releases/latest", HTML_TEMPLATE)
+        # The update check hits GitHub's public releases API (path derived from
+        # REPO_URL), not any usage data.
+        self.assertIn("'https://api.github.com/repos/'", HTML_TEMPLATE)
+        self.assertIn("/releases/latest", HTML_TEMPLATE)
 
 
 class TestPricingParity(unittest.TestCase):

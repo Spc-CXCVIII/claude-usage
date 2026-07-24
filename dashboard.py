@@ -10,7 +10,7 @@ import time
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from scanner import VERSION, get_db, init_db
 
@@ -282,6 +282,65 @@ def get_dashboard_data(db_path=DB_PATH):
         "status":         r["status"],
     } for r in top_dispatch_rows]
 
+    # ── "Today" stat row, pinned to the Indochina-Time (UTC+7) calendar day ───
+    # Independent of any client-side range filter and recomputed on every call
+    # (this endpoint is polled every 2s while live), so the row rolls over at
+    # 00:00 ICT (17:00 UTC) automatically. daily_by_model/hourly_by_model can't
+    # answer this: they only carry whole-UTC-day buckets, and ICT midnight
+    # rarely lines up with a UTC day boundary, so the window is computed
+    # directly against `turns.timestamp` instead. Boundaries are compared as
+    # the first 19 chars ("YYYY-MM-DDTHH:MM:SS") rather than the full string —
+    # stored timestamps carry milliseconds and a "Z" suffix that would sort a
+    # timestamp at exactly the boundary second *before* a millisecond-less
+    # boundary string ("...12.345Z" < "...12Z" lexicographically).
+    now_utc = datetime.now(timezone.utc)
+    ict_date = (now_utc + timedelta(hours=7)).date()
+    today_start_utc = datetime(ict_date.year, ict_date.month, ict_date.day, tzinfo=timezone.utc) - timedelta(hours=7)
+    today_end_utc = today_start_utc + timedelta(days=1)
+    today_start_str = today_start_utc.strftime("%Y-%m-%dT%H:%M:%S")
+    today_end_str = today_end_utc.strftime("%Y-%m-%dT%H:%M:%S")
+
+    today_rows = conn.execute("""
+        SELECT
+            substr(timestamp, 1, 10)   as day,
+            COALESCE(NULLIF(model, ''), 'unknown') as model,
+            SUM(input_tokens)          as input,
+            SUM(output_tokens)         as output,
+            SUM(cache_read_tokens)     as cache_read,
+            SUM(cache_creation_tokens) as cache_creation,
+            COUNT(*)                   as turns
+        FROM turns
+        WHERE timestamp IS NOT NULL
+          AND substr(timestamp, 1, 19) >= ? AND substr(timestamp, 1, 19) < ?
+        GROUP BY day, COALESCE(NULLIF(model, ''), 'unknown')
+        ORDER BY day, model
+    """, (today_start_str, today_end_str)).fetchall()
+
+    today_by_model = [{
+        "day":            r["day"],
+        "model":          r["model"],
+        "input":          r["input"] or 0,
+        "output":         r["output"] or 0,
+        "cache_read":     r["cache_read"] or 0,
+        "cache_creation": r["cache_creation"] or 0,
+        "turns":          r["turns"] or 0,
+    } for r in today_rows]
+
+    today_subagent_rows = conn.execute("""
+        SELECT
+            COALESCE(NULLIF(model, ''), 'unknown') as model,
+            SUM(input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens) as tokens
+        FROM turns
+        WHERE is_subagent = 1 AND timestamp IS NOT NULL
+          AND substr(timestamp, 1, 19) >= ? AND substr(timestamp, 1, 19) < ?
+        GROUP BY COALESCE(NULLIF(model, ''), 'unknown')
+    """, (today_start_str, today_end_str)).fetchall()
+
+    today_subagent_by_model = [{
+        "model":  r["model"],
+        "tokens": r["tokens"] or 0,
+    } for r in today_subagent_rows]
+
     # ── User settings (persisted server-side, see POST /api/settings) ─────────
     settings_rows = conn.execute("SELECT key, value FROM settings").fetchall()
     settings = {r["key"]: r["value"] for r in settings_rows}
@@ -299,6 +358,13 @@ def get_dashboard_data(db_path=DB_PATH):
         "sessions_all":    sessions_all,
         "subagent_by_type": subagent_by_type,
         "top_dispatches":  top_dispatches,
+        "today_by_model":  today_by_model,
+        "today_subagent_by_model": today_subagent_by_model,
+        "today_window": {
+            "start": today_start_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "end":   today_end_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "ict_date": ict_date.isoformat(),
+        },
         "generated_at":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
@@ -434,6 +500,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .stat-card .label { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 6px; }
   .stat-card .value { font-size: 17px; font-weight: 700; font-family: var(--font-mono); letter-spacing: -0.02em; }
   .stat-card .sub { color: var(--muted); font-size: 10px; margin-top: 4px; }
+  /* "Today" row: same ledger layout, tinted warm/accent so it reads as a
+     lighter, secondary echo of the overall row above it rather than a
+     second identical block. */
+  .stats-label-row { display: flex; align-items: center; gap: 6px; margin-bottom: 10px; margin-top: -8px; }
+  .stats-label-row .section-title { margin-bottom: 0; }
+  .stats-row.today-row { background: rgba(217,119,87,0.16); border-color: rgba(217,119,87,0.16); }
+  .stats-row.today-row .stat-card { background: #211D1A; }
+  .stats-row.today-row .stat-card .label { color: var(--accent); }
 
   .charts-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 24px; }
   /* min-width:0 lets the grid column shrink below the canvas's intrinsic
@@ -635,6 +709,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
 <div class="container">
   <div class="stats-row" id="stats-row"></div>
+  <div class="stats-label-row" id="today-stats-label" style="display:none">
+    <div class="section-title">Today <span class="info-icon" tabindex="0" role="img" aria-label="About this row" title="Turns whose timestamp falls in the current Indochina-Time (UTC+7) day — resets at 00:00 ICT (17:00 UTC), independent of the range filter above. Respects the model filter."><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg></span></div>
+  </div>
+  <div class="stats-row today-row" id="stats-row-today" style="display:none"></div>
   <div class="charts-grid">
     <div class="chart-card wide" id="sec-daily" data-card="daily">
       <h2><span class="card-caret">&#9656;</span><span id="daily-chart-title">Daily Token Usage</span></h2>
@@ -782,9 +860,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <div class="footer-content">
     <p>Cost estimates based on Anthropic API pricing (<a href="https://claude.com/pricing#api" target="_blank">claude.com/pricing#api</a>) as of June 2026. Sonnet 5 usage dated on or before 2026-08-31 is priced at its introductory rate ($2/$10 per MTok); later usage at the standard rate ($3/$15). Only models containing <em>fable</em>, <em>mythos</em>, <em>opus</em>, <em>sonnet</em>, or <em>haiku</em> in the name are included in cost calculations. Actual costs for Max/Pro subscribers differ from API pricing.</p>
     <p>
-      GitHub: <a href="https://github.com/phuryn/claude-usage" target="_blank">https://github.com/phuryn/claude-usage</a>
+      GitHub: <a href="https://github.com/Spc-CXCVIII/claude-usage" target="_blank">https://github.com/Spc-CXCVIII/claude-usage</a>
       &nbsp;&middot;&nbsp;
-      Created by: <a href="https://www.productcompass.pm" target="_blank">The Product Compass Newsletter</a>
+      Fork of <a href="https://github.com/phuryn/claude-usage" target="_blank">claude-usage</a>, originally by <a href="https://www.productcompass.pm" target="_blank">Pawel Huryn / The Product Compass Newsletter</a>
       &nbsp;&middot;&nbsp;
       License: MIT
     </p>
@@ -810,7 +888,7 @@ function escAttr(s) {
 let rawData = null;
 let selectedModels = new Set();
 let allModelsList = [];
-let selectedRange = '30d';
+let selectedRange = 'all';
 let charts = {};
 let sessionSortCol = 'last';
 let modelSortCol = 'cost';
@@ -1209,9 +1287,9 @@ function getRangeBounds(range) {
 
 function readURLRange() {
   const p = new URLSearchParams(window.location.search).get('range');
-  if (!VALID_RANGES.includes(p)) return '30d';
+  if (!VALID_RANGES.includes(p)) return 'all';
   // Subscription-anchored ranges are meaningless without a subscription date.
-  if ((p === 'sub-month' || p === 'sub-prev-month') && !subscriptionStart) return '30d';
+  if ((p === 'sub-month' || p === 'sub-prev-month') && !subscriptionStart) return 'all';
   return p;
 }
 
@@ -1230,7 +1308,7 @@ function applySubscriptionStart(v) {
   if (input && input.value !== (subscriptionStart || '')) input.value = subscriptionStart || '';
   updateSubRangeOptions();
   if (!subscriptionStart && (selectedRange === 'sub-month' || selectedRange === 'sub-prev-month')) {
-    setRange('30d');  // the anchored range just lost its anchor
+    setRange('all');  // the anchored range just lost its anchor
   } else {
     applyFilter();
   }
@@ -1437,7 +1515,7 @@ function clearAllModels() {
 function updateURL() {
   const allModels = Array.from(document.querySelectorAll('#model-checkboxes input')).map(cb => cb.value);
   const params = new URLSearchParams();
-  if (selectedRange !== '30d') params.set('range', selectedRange);
+  if (selectedRange !== 'all') params.set('range', selectedRange);
   if (!isDefaultModelSelection(allModels)) params.set('models', Array.from(selectedModels).join(','));
   const search = params.toString() ? '?' + params.toString() : '';
   history.replaceState(null, '', window.location.pathname + search);
@@ -1658,6 +1736,7 @@ function applyFilter() {
   document.getElementById('tools-chart-title').textContent = 'Turns by Tool \u2014 ' + titleLabel;
 
   renderStats(totals);
+  renderTodayStats();
   renderDailyChart(daily);
   renderHourlyChart(hourlyAgg);
   renderModelChart(byModel);
@@ -1801,8 +1880,77 @@ function runCellAnims(bodyId) {
   });
 }
 
-function renderStats(t) {
-  const rangeLabel = RANGE_LABELS[selectedRange].toLowerCase();
+// ── "Today" stat row (Indochina Time / UTC+7) ───────────────────────────────
+// A second, fixed echo of the stat row above: always the current ICT
+// calendar day, regardless of the range filter (only the model filter
+// applies). The server already narrowed today_by_model / today_subagent_by_model
+// to the exact ICT window (see get_dashboard_data in dashboard.py — daily_by_model
+// only has whole-UTC-day granularity, which isn't precise enough near the
+// boundary), so this just sums what's already scoped and reuses the same
+// cost/savings math as the main row. today_window lets sessions_all (whose
+// `last` field is UTC, minute precision) be filtered the same way sessions
+// are filtered for the main row.
+function renderTodayStats() {
+  const win = rawData && rawData.today_window;
+  const wrap = document.getElementById('today-stats-label');
+  const row = document.getElementById('stats-row-today');
+  if (!win) { wrap.style.display = 'none'; row.style.display = 'none'; return; }
+  wrap.style.display = '';
+  row.style.display = '';
+
+  const winStart = new Date(win.start);
+  const winEnd = new Date(win.end);
+
+  const todayRows = (rawData.today_by_model || []).filter(r => selectedModels.has(r.model));
+  const todaySessions = (rawData.sessions_all || []).filter(s => {
+    if (!selectedModels.has(s.model) || !s.last) return false;
+    const ts = new Date(s.last.replace(' ', 'T') + ':00Z');
+    return ts >= winStart && ts < winEnd;
+  });
+  const todaySubagentTokens = (rawData.today_subagent_by_model || [])
+    .filter(r => selectedModels.has(r.model))
+    .reduce((s, r) => s + r.tokens, 0);
+
+  const todayTotals = {
+    sessions:        todaySessions.length,
+    turns:           todayRows.reduce((s, r) => s + r.turns, 0),
+    input:           todayRows.reduce((s, r) => s + r.input, 0),
+    output:          todayRows.reduce((s, r) => s + r.output, 0),
+    cache_read:      todayRows.reduce((s, r) => s + r.cache_read, 0),
+    cache_creation:  todayRows.reduce((s, r) => s + r.cache_creation, 0),
+    subagent_tokens: todaySubagentTokens,
+    cost: todayRows.reduce((s, r) =>
+      s + calcCost(r.model, r.input, r.output, r.cache_read, r.cache_creation, r.day), 0),
+    cache_savings: todayRows.reduce((s, r) => {
+      if (!isBillable(r.model)) return s;
+      const p = getPricing(r.model, r.day);
+      if (!p) return s;
+      return s + (r.cache_read * (p.input - p.cache_read) - r.cache_creation * (p.cache_write - p.input)) / 1e6;
+    }, 0),
+  };
+
+  renderStats(todayTotals, {
+    targetId: 'stats-row-today',
+    idPrefix: 'today-stat-val-',
+    keyPrefix: 'today|',
+    rangeLabel: 'today · resets 00:00 ICT',
+    updateHeader: false,
+  });
+}
+
+// opts lets a second row (the "Today" ICT card, see renderTodayStats) reuse
+// this renderer against its own container/element-ids/animation-state
+// namespace instead of colliding with the main row's `stat-val-*` ids and
+// `statPrev[label]` keys.
+function renderStats(t, opts = {}) {
+  const {
+    targetId = 'stats-row',
+    idPrefix = 'stat-val-',
+    keyPrefix = '',
+    rangeLabel: rangeLabelOverride = null,
+    updateHeader = true,
+  } = opts;
+  const rangeLabel = rangeLabelOverride || RANGE_LABELS[selectedRange].toLowerCase();
   // Intermediate tween values are floats — round before the integer formats.
   const intFmt = v => Math.round(v).toLocaleString();
   const tokFmt = v => fmt(Math.round(v));
@@ -1817,18 +1965,20 @@ function renderStats(t) {
     { label: 'Cache Savings',   raw: t.cache_savings || 0,   format: fmtSaving,  sub: 'vs paying input rate', color: C.green },
     { label: 'Est. Cost',       raw: t.cost,                 format: fmtCostBig, sub: 'API pricing, June 2026', color: C.green },
   ];
-  document.getElementById('stats-row').innerHTML = stats.map((s, i) => `
+  document.getElementById(targetId).innerHTML = stats.map((s, i) => `
     <div class="stat-card">
       <div class="label">${s.label}</div>
-      <div class="value" id="stat-val-${i}" style="${s.color ? 'color:' + s.color : ''}"></div>
+      <div class="value" id="${idPrefix}${i}" style="${s.color ? 'color:' + s.color : ''}"></div>
       ${s.sub ? `<div class="sub">${esc(s.sub)}</div>` : ''}
     </div>
   `).join('');
   stats.forEach((s, i) => {
-    animateValue(document.getElementById('stat-val-' + i), statPrev[s.label], s.raw, s.format);
-    statPrev[s.label] = s.raw;
+    const key = keyPrefix + s.label;
+    animateValue(document.getElementById(idPrefix + i), statPrev[key], s.raw, s.format);
+    statPrev[key] = s.raw;
   });
 
+  if (!updateHeader) return;
   // Header shows the filtered range's Est. Cost instead of the static app
   // name, counting up with the stat cards; the tab title jumps straight to
   // the final value (per-frame tab-title updates read as flicker).
@@ -2704,7 +2854,7 @@ function scheduleAutoRefresh() {
 // ── Footer meta: version, extension promo, update check ──────────────────────
 // APP_CONFIG is injected server-side (see do_GET). { version, surface }.
 const APP_CONFIG = window.APP_CONFIG || { version: '', surface: 'web' };
-const REPO_URL = 'https://github.com/phuryn/claude-usage';
+const REPO_URL = 'https://github.com/Spc-CXCVIII/claude-usage';
 const MARKETPLACE_URL = 'https://marketplace.visualstudio.com/items?itemName=PawelHuryn.claude-usage-phuryn';
 const UPDATE_CACHE_KEY = 'cu_update_check';
 const UPDATE_CACHE_TTL = 24 * 60 * 60 * 1000;  // re-check GitHub at most once a day
@@ -2746,7 +2896,7 @@ function checkForUpdate(current) {
     if (isNewer(cached.latest, current)) appendUpdateLink(cached.latest);
     return;
   }
-  fetch('https://api.github.com/repos/phuryn/claude-usage/releases/latest', {
+  fetch(REPO_URL.replace('https://github.com/', 'https://api.github.com/repos/') + '/releases/latest', {
     headers: { 'Accept': 'application/vnd.github+json' }
   })
     .then(r => r.ok ? r.json() : null)
