@@ -713,6 +713,36 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div class="section-title">Today <span class="info-icon" tabindex="0" role="img" aria-label="About this row" title="Turns whose timestamp falls in the current Indochina-Time (UTC+7) day — resets at 00:00 ICT (17:00 UTC), independent of the range filter above. Respects the model filter."><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg></span></div>
   </div>
   <div class="stats-row today-row" id="stats-row-today" style="display:none"></div>
+  <div class="table-card" id="sec-billing" data-card="billing-cycles">
+    <div class="section-header"><div class="section-title"><span class="card-caret">&#9656;</span>Billing Cycles <span class="info-icon" tabindex="0" role="img" aria-label="About this table" title="One row per subscription month, anchored on the Sub Start day — e.g. a June 22 start bills the 22nd of each month through the 21st of the next. Respects the model filter; ignores the date-range filter."><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg></span></div><button class="export-btn" onclick="exportCyclesCSV()" title="Export all billing cycles to CSV">&#x2913; CSV</button></div>
+    <table>
+      <thead><tr>
+        <th>Cycle</th><th>Days</th><th>Turns</th><th>Input</th><th>Output</th>
+        <th>Cache Read</th><th>Cache Creation</th><th>Est. Cost</th><th>vs Prev</th>
+      </tr></thead>
+      <tbody id="billing-body"></tbody>
+    </table>
+    <div class="table-foot" id="billing-foot"></div>
+  </div>
+  <div class="table-card" id="sec-sessions" data-card="sessions">
+    <div class="section-header"><div class="section-title"><span class="card-caret">&#9656;</span>Recent Sessions</div><button class="export-btn" onclick="exportSessionsCSV()" title="Export all filtered sessions to CSV">&#x2913; CSV</button></div>
+    <table>
+      <thead><tr>
+        <th>Session</th>
+        <th>Project</th>
+        <th>Title</th>
+        <th class="sortable" onclick="setSessionSort('last')">Last Active <span class="sort-icon" id="sort-icon-last"></span></th>
+        <th class="sortable" onclick="setSessionSort('duration_min')">Duration <span class="sort-icon" id="sort-icon-duration_min"></span></th>
+        <th>Model</th>
+        <th class="sortable" onclick="setSessionSort('turns')">Turns <span class="sort-icon" id="sort-icon-turns"></span></th>
+        <th class="sortable" onclick="setSessionSort('input')">Input <span class="sort-icon" id="sort-icon-input"></span></th>
+        <th class="sortable" onclick="setSessionSort('output')">Output <span class="sort-icon" id="sort-icon-output"></span></th>
+        <th class="sortable" onclick="setSessionSort('cost')">Est. Cost <span class="sort-icon" id="sort-icon-cost"></span></th>
+      </tr></thead>
+      <tbody id="sessions-body"></tbody>
+    </table>
+    <div class="table-foot" id="sessions-foot"></div>
+  </div>
   <div class="charts-grid">
     <div class="chart-card wide" id="sec-daily" data-card="daily">
       <h2><span class="card-caret">&#9656;</span><span id="daily-chart-title">Daily Token Usage</span></h2>
@@ -756,17 +786,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <div class="heatmap-scroll" id="heatmap-scroll"></div>
     </div>
   </div>
-  <div class="table-card" id="sec-billing" data-card="billing-cycles">
-    <div class="section-header"><div class="section-title"><span class="card-caret">&#9656;</span>Billing Cycles <span class="info-icon" tabindex="0" role="img" aria-label="About this table" title="One row per subscription month, anchored on the Sub Start day — e.g. a June 22 start bills the 22nd of each month through the 21st of the next. Respects the model filter; ignores the date-range filter."><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg></span></div><button class="export-btn" onclick="exportCyclesCSV()" title="Export all billing cycles to CSV">&#x2913; CSV</button></div>
-    <table>
-      <thead><tr>
-        <th>Cycle</th><th>Days</th><th>Turns</th><th>Input</th><th>Output</th>
-        <th>Cache Read</th><th>Cache Creation</th><th>Est. Cost</th><th>vs Prev</th>
-      </tr></thead>
-      <tbody id="billing-body"></tbody>
-    </table>
-    <div class="table-foot" id="billing-foot"></div>
-  </div>
   <div class="table-card" id="sec-cache" data-card="cache-efficiency">
     <div class="section-title"><span class="card-caret">&#9656;</span>Cache Efficiency <span class="info-icon" tabindex="0" role="img" aria-label="About this table" title="How much of each model's context was served from the prompt cache, and the estimated net saving vs paying the full input rate for those tokens (cache reads cost ~10% of input; cache writes cost ~25% more than input and are subtracted). Follows the model and date-range filters."><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg></span></div>
     <table>
@@ -803,25 +822,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <tbody id="dispatches-body"></tbody>
     </table>
     <div class="table-foot" id="dispatches-foot"></div>
-  </div>
-  <div class="table-card" id="sec-sessions" data-card="sessions">
-    <div class="section-header"><div class="section-title"><span class="card-caret">&#9656;</span>Recent Sessions</div><button class="export-btn" onclick="exportSessionsCSV()" title="Export all filtered sessions to CSV">&#x2913; CSV</button></div>
-    <table>
-      <thead><tr>
-        <th>Session</th>
-        <th>Project</th>
-        <th>Title</th>
-        <th class="sortable" onclick="setSessionSort('last')">Last Active <span class="sort-icon" id="sort-icon-last"></span></th>
-        <th class="sortable" onclick="setSessionSort('duration_min')">Duration <span class="sort-icon" id="sort-icon-duration_min"></span></th>
-        <th>Model</th>
-        <th class="sortable" onclick="setSessionSort('turns')">Turns <span class="sort-icon" id="sort-icon-turns"></span></th>
-        <th class="sortable" onclick="setSessionSort('input')">Input <span class="sort-icon" id="sort-icon-input"></span></th>
-        <th class="sortable" onclick="setSessionSort('output')">Output <span class="sort-icon" id="sort-icon-output"></span></th>
-        <th class="sortable" onclick="setSessionSort('cost')">Est. Cost <span class="sort-icon" id="sort-icon-cost"></span></th>
-      </tr></thead>
-      <tbody id="sessions-body"></tbody>
-    </table>
-    <div class="table-foot" id="sessions-foot"></div>
   </div>
   <div class="table-card" id="sec-cost-project" data-card="cost-by-project">
     <div class="section-header"><div class="section-title"><span class="card-caret">&#9656;</span>Cost by Project</div><button class="export-btn" onclick="exportProjectsCSV()" title="Export all projects to CSV">&#x2913; CSV</button></div>
