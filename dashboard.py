@@ -791,7 +791,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <th>Session</th>
         <th>Project</th>
         <th>Title</th>
-        <th class="sortable" onclick="setSessionSort('last')">Last Active <span class="sort-icon" id="sort-icon-last"></span></th>
+        <th class="sortable" onclick="setSessionSort('last')" title="Shown in your browser's local timezone">Last Active <span class="sort-icon" id="sort-icon-last"></span></th>
         <th class="sortable" onclick="setSessionSort('duration_min')">Duration <span class="sort-icon" id="sort-icon-duration_min"></span></th>
         <th>Model</th>
         <th class="sortable" onclick="setSessionSort('turns')">Turns <span class="sort-icon" id="sort-icon-turns"></span></th>
@@ -876,7 +876,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div class="section-header"><div class="section-title"><span class="card-caret">&#9656;</span>Top Subagent Dispatches <span class="info-icon" tabindex="0" role="img" aria-label="About this table" title="Ranked by total tokens. &quot;unknown&quot; means the parent dispatch record wasn't found."><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg></span></div><button class="export-btn" onclick="exportDispatchesCSV()" title="Export all filtered subagent dispatches to CSV">&#x2913; CSV</button></div>
     <table>
       <thead><tr>
-        <th>Type</th><th>Started</th><th>Model</th><th>Turns</th><th>Tool Uses</th>
+        <th>Type</th><th title="Shown in your browser's local timezone">Started</th><th>Model</th><th>Turns</th><th>Tool Uses</th>
         <th>Duration</th><th>Input</th><th>Output</th><th>Cache Read</th><th>Tokens</th><th>Est. Cost</th>
       </tr></thead>
       <tbody id="dispatches-body"></tbody>
@@ -1127,6 +1127,19 @@ function fmtCostBig(c) { return '$' + c.toLocaleString(undefined, { minimumFract
 // Savings can go negative (heavy cache writes, few reads) — keep the sign
 // outside the dollar amount so it doesn't read as "$-1.23".
 function fmtSaving(c)  { return (c < 0 ? '-' : '') + fmtCostBig(Math.abs(c)); }
+
+// Table timestamps (sessions "Last Active", dispatches "Started") arrive from
+// the server as UTC, minute precision, pre-formatted "YYYY-MM-DD HH:MM" with no
+// timezone marker (see get_dashboard_data). Reattach the "Z" and read back
+// through the Date object's local getters — same trick localISODate() uses —
+// so the table shows the viewer's local time instead of raw UTC.
+function fmtLocalDT(utcMinuteStr) {
+  if (!utcMinuteStr) return '—';
+  const d = new Date(utcMinuteStr.replace(' ', 'T') + ':00Z');
+  if (isNaN(d)) return utcMinuteStr;
+  const pad = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
 
 // ── Chart colors ───────────────────────────────────────────────────────────
 // Warm/neutral palette kept in sync with the CSS :root variables so charts match
@@ -2490,7 +2503,7 @@ function renderTopDispatches(rows) {
     const typeStyle = `background:${col}22;color:${col};border:1px solid ${col}44`;
     return `<tr>
       <td><span class="model-tag" style="${typeStyle}">${esc(d.agent_type)}</span></td>
-      <td class="muted">${esc(d.start || '—')}</td>
+      <td class="muted">${esc(fmtLocalDT(d.start))}</td>
       <td><span class="model-tag">${esc(d.model)}</span></td>
       <td class="num">${animNum(k + 'turns', d.turns, 'int')}</td>
       <td class="num">${d.tool_uses != null ? animNum(k + 'tools', d.tool_uses, 'int') : '—'}</td>
@@ -2568,7 +2581,7 @@ function renderSessionsTable(sessions) {
       <td class="muted" style="font-family:monospace">${esc(s.session_id.slice(0, 8))}&hellip;</td>
       <td>${esc(s.project)}</td>
       ${titleCell}
-      <td class="muted">${esc(s.last)}</td>
+      <td class="muted">${esc(fmtLocalDT(s.last))}</td>
       <td class="muted">${fmtDurationMin(s.duration_min)}</td>
       <td><span class="model-tag">${esc(s.model)}</span></td>
       <td class="num">${animNum(k + 'turns', s.turns, 'int')}</td>
@@ -2816,7 +2829,7 @@ function exportSessionsCSV() {
   const header = ['Session', 'Project', 'Title', 'Last Active', 'Duration (min)', 'Model', 'Turns', 'Input', 'Output', 'Cache Read', 'Cache Creation', 'Est. Cost'];
   const rows = lastFilteredSessions.map(s => {
     const cost = calcCost(s.model, s.input, s.output, s.cache_read, s.cache_creation, s.last_date);
-    return [s.session_id, s.project, s.topic, s.last, s.duration_min, s.model, s.turns, s.input, s.output, s.cache_read, s.cache_creation, cost.toFixed(4)];
+    return [s.session_id, s.project, s.topic, fmtLocalDT(s.last), s.duration_min, s.model, s.turns, s.input, s.output, s.cache_read, s.cache_creation, cost.toFixed(4)];
   });
   downloadCSV('sessions', header, rows);
 }
@@ -2851,7 +2864,7 @@ function exportDispatchesCSV() {
   const rows = lastFilteredDispatches.map(d => {
     const total = d.input + d.output + d.cache_read + d.cache_creation;
     const cost = calcCost(d.model, d.input, d.output, d.cache_read, d.cache_creation, d.start);
-    return [d.agent_type, d.agent_id, d.start, d.model, d.turns,
+    return [d.agent_type, d.agent_id, fmtLocalDT(d.start), d.model, d.turns,
             d.tool_uses != null ? d.tool_uses : '', d.duration_ms != null ? d.duration_ms : '',
             d.input, d.output, d.cache_read, d.cache_creation, total, cost.toFixed(4), d.status || ''];
   });
