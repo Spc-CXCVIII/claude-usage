@@ -16,7 +16,7 @@ class TestGetPricing(unittest.TestCase):
 
     def test_all_known_models_have_pricing(self):
         for model in ("claude-fable-5", "claude-mythos-5",
-                       "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-opus-4-5",
+                       "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-opus-4-5",
                        "claude-sonnet-4-7", "claude-sonnet-4-6", "claude-sonnet-4-5",
                        "claude-haiku-4-7", "claude-haiku-4-6", "claude-haiku-4-5"):
             p = get_pricing(model)
@@ -47,6 +47,14 @@ class TestGetPricing(unittest.TestCase):
             p = get_pricing(model)
             self.assertEqual(p["input"], 10.00, f"{model} should map to Fable pricing")
             self.assertEqual(p["output"], 50.00, f"{model} should map to Fable pricing")
+
+    def test_opus_5_has_explicit_entry(self):
+        """Opus 5 must be present, not just resolved via the generic 'opus'
+        substring fallback (matches Fable/Mythos regression guard above)."""
+        self.assertIn("claude-opus-5", PRICING)
+        p = get_pricing("claude-opus-5")
+        self.assertEqual(p["input"], 5.00)
+        self.assertEqual(p["output"], 25.00)
 
     def test_opus_4_8_has_explicit_entry(self):
         """Regression guard for issue #133 — Opus 4.8 must be present, not just

@@ -23,6 +23,7 @@ PRICING = {
     # (Mythos 5 shares Fable 5's pricing; Project-Glasswing access only.)
     "claude-fable-5":    {"input": 10.00, "output": 50.00, "cache_read": 1.00, "cache_write": 12.50},
     "claude-mythos-5":   {"input": 10.00, "output": 50.00, "cache_read": 1.00, "cache_write": 12.50},
+    "claude-opus-5":     {"input": 5.00, "output": 25.00, "cache_read": 0.50, "cache_write": 6.25},
     "claude-opus-4-8":   {"input": 5.00, "output": 25.00, "cache_read": 0.50, "cache_write": 6.25},
     "claude-opus-4-7":   {"input": 5.00, "output": 25.00, "cache_read": 0.50, "cache_write": 6.25},
     "claude-opus-4-6":   {"input": 5.00, "output": 25.00, "cache_read": 0.50, "cache_write": 6.25},
@@ -61,7 +62,7 @@ def _resolve_pricing_key(model):
     if "fable" in m or "mythos" in m:
         return "claude-fable-5"
     if "opus" in m:
-        return "claude-opus-4-8"
+        return "claude-opus-5"
     if "sonnet" in m:
         return "claude-sonnet-4-6"
     if "haiku" in m:

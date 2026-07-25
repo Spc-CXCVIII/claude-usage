@@ -1045,6 +1045,7 @@ const PRICING = {
   // (Mythos 5 shares Fable 5's pricing; Project-Glasswing access only.)
   'claude-fable-5':    { input: 10.00, output: 50.00, cache_write: 12.50, cache_read: 1.00 },
   'claude-mythos-5':   { input: 10.00, output: 50.00, cache_write: 12.50, cache_read: 1.00 },
+  'claude-opus-5':     { input:  5.00, output: 25.00, cache_write:  6.25, cache_read: 0.50 },
   'claude-opus-4-8':   { input:  5.00, output: 25.00, cache_write:  6.25, cache_read: 0.50 },
   'claude-opus-4-7':   { input:  5.00, output: 25.00, cache_write:  6.25, cache_read: 0.50 },
   'claude-opus-4-6':   { input:  5.00, output: 25.00, cache_write:  6.25, cache_read: 0.50 },
@@ -1084,7 +1085,7 @@ function resolvePricingKey(model) {
   }
   const m = model.toLowerCase();
   if (m.includes('fable') || m.includes('mythos')) return 'claude-fable-5';
-  if (m.includes('opus'))   return 'claude-opus-4-8';
+  if (m.includes('opus'))   return 'claude-opus-5';
   if (m.includes('sonnet')) return 'claude-sonnet-4-6';
   if (m.includes('haiku'))  return 'claude-haiku-4-5';
   return null;
