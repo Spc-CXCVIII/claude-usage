@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.5.6 — TBD
+
+### Dashboard
+
+- Added a light/dark theme toggle (sun/moon icon button, top right of the header) with a dedicated light color set for the CSS surface variables, Chart.js chart colors, and the cost heatmap ramp. Defaults to dark and persists the choice in `localStorage`; an inline anti-flash script applies the saved theme before first paint.
+
 ## v1.5.5 — 2026-07-10
 
 ### Dashboard

@@ -377,6 +377,18 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <title>Claude Code Usage Dashboard</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <script>window.APP_CONFIG = __APP_CONFIG_JSON__;</script>
+<script>
+// Set the theme attribute before first paint so there's no dark->light flash
+// on load. Kept tiny + inline (no dependency on the deferred main script).
+(function() {
+  var t = 'dark';
+  try {
+    var stored = localStorage.getItem('claude-usage-theme');
+    if (stored === 'light' || stored === 'dark') t = stored;
+  } catch (e) {}
+  document.documentElement.setAttribute('data-theme', t);
+})();
+</script>
 <style>
   :root {
     --bg: #161617;      /* page base */
@@ -390,25 +402,55 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     --red: #C74E39;
     --raised: #2E2F31;  /* hover / raised surfaces — top of the elevation ladder */
     --selected: #262626;  /* selected chips / tabs (neutral, not accent) */
+    --hm-empty: #242526;      /* heatmap cell with no usage */
+    --today-card-bg: #211D1A; /* "Today" stat row card — warm dark tint */
+    --scrollbar-track: #121314;
+    --scrollbar-thumb: #28292B;
+    --scrollbar-thumb-hover: #8B8B8D;
+    --color-scheme: dark;  /* native form controls (date picker popup, etc.) */
     --jump-h: 45px;  /* sticky jump-bar height; JS keeps it in sync for scroll offsets */
     --radius-md: 3px;   /* cards / panels — sharp, ledger-like rather than soft SaaS rounding */
     --radius-sm: 2px;   /* buttons / chips / inputs */
     --font-mono: ui-monospace, 'Cascadia Code', 'SF Mono', Consolas, monospace;
+  }
+  /* Light theme — warm paper/white surfaces, darkened accents so text/series
+     colors keep AA-ish contrast against white cards (the dark-theme hues are
+     too pale once the background flips). Toggled via [data-theme] on <html>,
+     set by the anti-FOUC inline script in <head> and JS's applyTheme(). */
+  :root[data-theme="light"] {
+    --bg: #F4F1EB;
+    --card: #FFFFFF;
+    --border: #E4DFD5;
+    --text: #2A2724;
+    --muted: #6E6659;
+    --accent: #B5502F;
+    --blue: #256F8C;
+    --green: #257A4E;
+    --red: #A83324;
+    --raised: #F0EBE1;
+    --selected: #E9E2D4;
+    --hm-empty: #EAE3D7;
+    --today-card-bg: #FBF1E9;
+    --scrollbar-track: #EDE8DE;
+    --scrollbar-thumb: #D6CFC0;
+    --scrollbar-thumb-hover: #B3A996;
+    --color-scheme: light;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 14px; }
 
   /* VS Code-style scrollbars. The dashboard renders inside a webview iframe,
      which doesn't inherit VS Code's --vscode-* theme variables, so we set the
-     scrollbar here: no arrows, grey thumb (#28292B, #8B8B8D on hover) over a
-     #121314 track, in a 21px gutter. Also fits the dark UI standalone. */
-  * { scrollbar-width: auto; scrollbar-color: #28292B #121314; }
+     scrollbar here: no arrows, a grey thumb over a slightly darker track, in a
+     21px gutter. Colors follow the --scrollbar-* theme variables so this fits
+     both the dark UI and the light theme standalone. */
+  * { scrollbar-width: auto; scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track); }
   ::-webkit-scrollbar { width: 21px; height: 21px; }
-  ::-webkit-scrollbar-track { background: #121314; }
-  ::-webkit-scrollbar-thumb { background-color: #28292B; border: 3px solid transparent; background-clip: padding-box; }
-  ::-webkit-scrollbar-thumb:hover { background-color: #8B8B8D; }
-  ::-webkit-scrollbar-thumb:active { background-color: #8B8B8D; }
-  ::-webkit-scrollbar-corner { background: #121314; }
+  ::-webkit-scrollbar-track { background: var(--scrollbar-track); }
+  ::-webkit-scrollbar-thumb { background-color: var(--scrollbar-thumb); border: 3px solid transparent; background-clip: padding-box; }
+  ::-webkit-scrollbar-thumb:hover { background-color: var(--scrollbar-thumb-hover); }
+  ::-webkit-scrollbar-thumb:active { background-color: var(--scrollbar-thumb-hover); }
+  ::-webkit-scrollbar-corner { background: var(--scrollbar-track); }
 
   header { background: var(--card); border-bottom: 1px solid var(--border); padding: 16px 24px; display: flex; align-items: center; justify-content: space-between; }
   /* tabular-nums keeps digit widths fixed so the count-up animation doesn't
@@ -428,6 +470,18 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   #rescan-btn { background: var(--card); border: 1px solid var(--border); color: var(--muted); padding: 4px 12px; border-radius: var(--radius-sm); cursor: pointer; font-size: 12px; margin-top: 4px; }
   #rescan-btn:hover { color: var(--text); border-color: var(--accent); }
   #rescan-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  header .header-actions { display: flex; align-items: center; gap: 10px; }
+  /* Theme toggle — same square-icon-button language as the rescan button.
+     Both icons are stacked in the DOM; CSS shows the one matching the
+     currently active theme (moon while dark, sun while light). JS mirrors
+     the same state into the button's title/aria-label text. */
+  #theme-toggle-btn { display: flex; align-items: center; justify-content: center; width: 28px; height: 28px; background: var(--card); border: 1px solid var(--border); color: var(--muted); border-radius: var(--radius-sm); cursor: pointer; margin-top: 4px; }
+  #theme-toggle-btn:hover { color: var(--text); border-color: var(--accent); }
+  #theme-toggle-btn svg { display: block; }
+  #theme-toggle-btn .icon-sun { display: none; }
+  #theme-toggle-btn .icon-moon { display: block; }
+  :root[data-theme="light"] #theme-toggle-btn .icon-sun { display: block; }
+  :root[data-theme="light"] #theme-toggle-btn .icon-moon { display: none; }
 
   #filter-bar { background: var(--card); border-bottom: 1px solid var(--border); padding: 10px 24px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
   .filter-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); white-space: nowrap; }
@@ -463,7 +517,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .range-select option:disabled { color: var(--muted); }
   /* Subscription start date — same visual language as the range/model triggers.
      color-scheme: dark keeps the native picker popup dark. */
-  .date-input { padding: 4px 9px; background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--text); font-size: 12px; font-family: inherit; color-scheme: dark; cursor: pointer; transition: border-color 0.15s; }
+  .date-input { padding: 4px 9px; background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--text); font-size: 12px; font-family: inherit; color-scheme: var(--color-scheme); cursor: pointer; transition: border-color 0.15s; }
   .date-input:hover, .date-input:focus { border-color: var(--accent); outline: none; }
   .date-input::-webkit-calendar-picker-indicator { cursor: pointer; opacity: 0.6; }
   .cycle-tag { display: inline-block; margin-left: 8px; padding: 1px 7px; border-radius: var(--radius-sm); font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; background: rgba(217,119,87,0.15); color: var(--accent); border: 1px solid rgba(217,119,87,0.35); }
@@ -483,7 +537,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .hm-months { display: grid; grid-auto-flow: column; grid-auto-columns: 19px; font-size: 9px; color: var(--muted); height: 14px; margin-bottom: 2px; }
   .hm-months span { overflow: visible; white-space: nowrap; }
   .hm-cells { display: grid; grid-auto-flow: column; grid-template-rows: repeat(7, 16px); grid-auto-columns: 16px; gap: 3px; }
-  .hm-cell { width: 16px; height: 16px; border-radius: 2px; background: #242526; }
+  .hm-cell { width: 16px; height: 16px; border-radius: 2px; background: var(--hm-empty); }
   .hm-cell:hover { outline: 1px solid var(--text); outline-offset: 0; }
   .hm-legend { display: inline-flex; align-items: center; gap: 3px; font-size: 11px; color: var(--muted); }
   .hm-legend .hm-cell { cursor: default; width: 12px; height: 12px; }
@@ -506,7 +560,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .stats-label-row { display: flex; align-items: center; gap: 6px; margin-bottom: 10px; margin-top: -8px; }
   .stats-label-row .section-title { margin-bottom: 0; }
   .stats-row.today-row { background: rgba(217,119,87,0.16); border-color: rgba(217,119,87,0.16); }
-  .stats-row.today-row .stat-card { background: #211D1A; }
+  .stats-row.today-row .stat-card { background: var(--today-card-bg); }
   .stats-row.today-row .stat-card .label { color: var(--accent); }
 
   .charts-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 24px; }
@@ -632,7 +686,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <h1 id="header-title">Claude Code Usage</h1>
   </div>
   <div class="meta" id="meta">Loading...</div>
-  <button id="rescan-btn" onclick="triggerRescan()" title="Scan for new usage since the last update. Adds new turns without affecting existing history.">&#x21bb; Rescan</button>
+  <div class="header-actions">
+    <button id="theme-toggle-btn" onclick="toggleTheme()" title="Switch theme" aria-label="Switch theme">
+      <svg class="icon-sun" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
+      <svg class="icon-moon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></svg>
+    </button>
+    <button id="rescan-btn" onclick="triggerRescan()" title="Scan for new usage since the last update. Adds new turns without affecting existing history.">&#x21bb; Rescan</button>
+  </div>
 </header>
 
 <div id="filter-bar">
@@ -1087,6 +1147,49 @@ const C = {
   teal:   '#5BB8A3',
   mauve:  '#C77E9B',
 };
+// ── Theme ──────────────────────────────────────────────────────────────────
+// Mirrors the CSS :root[data-theme] variables for canvas-drawn chart colors,
+// which can't read CSS custom properties. `C` above holds the dark defaults;
+// DARK_PALETTE snapshots them before anything mutates `C`, so toggling back
+// to dark restores exactly those values.
+const THEME_KEY = 'claude-usage-theme';
+let currentTheme = document.documentElement.getAttribute('data-theme') === 'light' ? 'light' : 'dark';
+const DARK_PALETTE = {
+  C: { text: C.text, muted: C.muted, axis: C.axis, border: C.border, card: C.card, blue: C.blue, green: C.green, red: C.red, accent: C.accent },
+  heatmap: ['#242526', '#45322B', '#7A4A38', '#AC6247', '#D97757'],
+};
+const LIGHT_PALETTE = {
+  C: { text: '#2A2724', muted: '#6E6659', axis: '#5B5449', border: '#E4DFD5', card: '#FFFFFF', blue: '#256F8C', green: '#257A4E', red: '#A83324', accent: '#B5502F' },
+  heatmap: ['#EAE3D7', '#F0C4A8', '#E0996C', '#C97247', '#B5502F'],
+};
+const THEME_PALETTES = { dark: DARK_PALETTE, light: LIGHT_PALETTE };
+let HM_THEME_COLORS = DARK_PALETTE.heatmap;  // overwritten by applyTheme() below
+
+function applyTheme(theme, opts = {}) {
+  const { persist = true, rerender = true } = opts;
+  currentTheme = theme === 'light' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', currentTheme);
+  if (persist) { try { localStorage.setItem(THEME_KEY, currentTheme); } catch (e) {} }
+
+  const palette = THEME_PALETTES[currentTheme];
+  Object.assign(C, palette.C);
+  HM_THEME_COLORS = palette.heatmap;
+  Chart.defaults.color = C.axis;
+
+  const btn = document.getElementById('theme-toggle-btn');
+  if (btn) {
+    const label = currentTheme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme';
+    btn.title = label;
+    btn.setAttribute('aria-label', label);
+  }
+
+  if (rerender && rawData) applyFilter();
+}
+function toggleTheme() { applyTheme(currentTheme === 'dark' ? 'light' : 'dark'); }
+// Sync the toggle button's title/aria-label for the theme picked before this
+// script ran (the anti-FOUC inline script already set the DOM attribute).
+applyTheme(currentTheme, { persist: false, rerender: false });
+
 const TOKEN_COLORS = {
   input:          'rgba(72,160,199,0.85)',   // blue
   output:         'rgba(217,119,87,0.85)',    // accent / coral
@@ -2266,9 +2369,10 @@ function renderToolsChart(byTool) {
 // Fixed window (last 26 whole weeks, Mon-start) independent of the range
 // filter — the point is the long-term rhythm — but it follows the model
 // filter. Sequential single-hue ramp of the accent, scaled to the window's
-// busiest day.
+// busiest day. The ramp itself is theme-dependent (see HM_THEME_COLORS,
+// swapped by applyTheme()), since a dark-to-accent ramp reads backwards on a
+// light background.
 const HM_WEEKS = 26;
-const HM_COLORS = ['#242526', '#45322B', '#7A4A38', '#AC6247', '#D97757'];
 
 function renderHeatmap() {
   const wrap = document.getElementById('heatmap-scroll');
@@ -2310,7 +2414,7 @@ function renderHeatmap() {
         const lv = !v || v.cost <= 0 ? 0
           : maxCost > 0 ? Math.min(4, Math.max(1, Math.ceil(v.cost / maxCost * 4))) : 0;
         const tip = iso + (v ? ' — ' + fmtCostBig(v.cost) + ' · ' + fmt(v.tokens) + ' tokens' : ' — no usage');
-        cells.push(`<span class="hm-cell" style="background:${HM_COLORS[lv]}" title="${esc(tip)}"></span>`);
+        cells.push(`<span class="hm-cell" style="background:${HM_THEME_COLORS[lv]}" title="${esc(tip)}"></span>`);
       }
       d.setDate(d.getDate() + 1);
     }
@@ -2326,7 +2430,7 @@ function renderHeatmap() {
   const legend = document.getElementById('heatmap-legend');
   if (legend) {
     legend.innerHTML = 'Less ' +
-      HM_COLORS.map(c => `<span class="hm-cell" style="background:${c}"></span>`).join('') +
+      HM_THEME_COLORS.map(c => `<span class="hm-cell" style="background:${c}"></span>`).join('') +
       ' More' + (maxCost > 0 ? ` · max ${fmtCostBig(maxCost)}/day` : '');
   }
 }
