@@ -4,6 +4,7 @@
 
 ### Dashboard
 
+- Added a **Refresh** control to the filter bar for choosing the auto-refresh interval (2s / 5s / 10s / 30s / 1m / 5m / Off), persisted in `localStorage` like the theme. 2s stays the floor because `/api/data` throttles its incremental scan to 1.5s server-side. The header note now reports the chosen cadence and says so explicitly when refresh is off or paused because the selected range excludes today.
 - Added a light/dark theme toggle (sun/moon icon button, top right of the header) with a dedicated light color set for the CSS surface variables, Chart.js chart colors, and the cost heatmap ramp. Defaults to dark and persists the choice in `localStorage`; an inline anti-flash script applies the saved theme before first paint.
 
 ### Scanner

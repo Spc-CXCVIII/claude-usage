@@ -26,13 +26,14 @@ DB_PATH = Path(os.environ.get("CLAUDE_USAGE_DB", Path.home() / ".claude" / "usag
 SURFACE = "web"
 
 # /api/data runs an incremental scan before reading the DB, so the browser's
-# 10s auto-refresh picks up usage from sessions that are still chatting —
-# without it, new transcript lines only land in the DB when the user presses
-# Rescan. Throttled so overlapping polls (multiple tabs, the VS Code panel)
-# don't stack scans, and lock-guarded because ThreadingHTTPServer handles
-# requests concurrently.
-# Must stay below the browser's poll interval (2s), or every other poll
-# would skip its scan.
+# auto-refresh picks up usage from sessions that are still chatting — without
+# it, new transcript lines only land in the DB when the user presses Rescan.
+# Throttled so overlapping polls (multiple tabs, the VS Code panel) don't stack
+# scans, and lock-guarded because ThreadingHTTPServer handles requests
+# concurrently.
+# Must stay below the *shortest* poll interval the Refresh dropdown offers
+# (REFRESH_CHOICES in HTML_TEMPLATE, currently 2s), or every other poll at that
+# setting would skip its scan.
 SCAN_MIN_INTERVAL = 1.5  # seconds between /api/data-triggered scans
 _scan_lock = threading.Lock()
 _last_scan_at = 0.0
@@ -724,6 +725,20 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <option value="all">All Time</option>
       <option value="sub-month" id="opt-sub-month" disabled>Billing Month</option>
       <option value="sub-prev-month" id="opt-sub-prev-month" disabled>Prev Billing Month</option>
+    </select>
+  </div>
+  <div class="filter-sep"></div>
+  <div class="filter-label">Refresh</div>
+  <div class="range-select">
+    <select id="refresh-select" aria-label="Auto-refresh interval" onchange="setRefreshInterval(this.value)"
+            title="How often the dashboard polls for new usage. Each poll also triggers an incremental scan on the server, so a shorter interval picks up in-flight sessions sooner. Only polls while the selected range includes today.">
+      <option value="2000">2s</option>
+      <option value="5000">5s</option>
+      <option value="10000">10s</option>
+      <option value="30000">30s</option>
+      <option value="60000">1m</option>
+      <option value="300000">5m</option>
+      <option value="0">Off</option>
     </select>
   </div>
   <div class="filter-sep"></div>
@@ -1453,6 +1468,7 @@ function setRange(range) {
   updateURL();
   applyFilter();
   scheduleAutoRefresh();
+  renderMeta();  // the paused/active note depends on whether the range covers today
 }
 
 function setHourlyTZ(mode) {
@@ -2890,6 +2906,21 @@ async function triggerRescan() {
 
 // ── Data loading ───────────────────────────────────────────────────────────
 let lastDataFingerprint = null;
+// Last server timestamp, kept so the header note can be repainted when the
+// refresh setting or the range changes — i.e. without waiting for a poll.
+let lastGeneratedAt = null;
+
+function renderMeta() {
+  const el = document.getElementById('meta');
+  if (!el || !lastGeneratedAt) return;
+  const ms = readRefreshInterval();
+  let note;
+  if (ms === 0) note = '<br>Auto-refresh off';
+  else if (!rangeIncludesToday(selectedRange)) note = '<br>Auto-refresh paused (range excludes today)';
+  else note = '<br>Auto-refresh every ' + formatRefreshInterval(ms);
+  el.innerHTML = 'Updated: ' + esc(lastGeneratedAt) + note;
+}
+
 async function loadData() {
   try {
     const resp = await fetch('/api/data');
@@ -2904,8 +2935,8 @@ async function loadData() {
       if (rawData === null) setTimeout(loadData, 3000);
       return;
     }
-    const refreshNote = rangeIncludesToday(selectedRange) ? '<br>Auto-refresh in 2s' : '';
-    document.getElementById('meta').innerHTML = 'Updated: ' + esc(d.generated_at) + refreshNote;
+    lastGeneratedAt = d.generated_at;
+    renderMeta();
 
     const isFirstLoad = rawData === null;
 
@@ -2961,11 +2992,48 @@ async function loadData() {
   }
 }
 
+// ── Auto-refresh interval ──────────────────────────────────────────────────
+// A per-surface UI preference like the theme, so it lives in localStorage and
+// not in the server-side settings table. 0 = off.
+//
+// 2s is the floor on purpose: /api/data runs an incremental scan throttled to
+// SCAN_MIN_INTERVAL (1.5s) server-side, so polling any faster would make every
+// other poll skip its scan without surfacing fresher data.
+const REFRESH_KEY = 'cu_refresh_interval';
+const REFRESH_CHOICES = [2000, 5000, 10000, 30000, 60000, 300000];
+const REFRESH_DEFAULT = 2000;
+
+function readRefreshInterval() {
+  let stored = null;
+  try { stored = localStorage.getItem(REFRESH_KEY); } catch (e) {}
+  const ms = parseInt(stored, 10);
+  return (ms === 0 || REFRESH_CHOICES.includes(ms)) ? ms : REFRESH_DEFAULT;
+}
+
+function formatRefreshInterval(ms) {
+  return ms % 60000 === 0 ? (ms / 60000) + 'm' : (ms / 1000) + 's';
+}
+
+function setRefreshInterval(value) {
+  const parsed = parseInt(value, 10);
+  const ms = (parsed === 0 || REFRESH_CHOICES.includes(parsed)) ? parsed : REFRESH_DEFAULT;
+  try { localStorage.setItem(REFRESH_KEY, String(ms)); } catch (e) {}
+  const sel = document.getElementById('refresh-select');
+  if (sel) sel.value = String(ms);
+  scheduleAutoRefresh();
+  // Repaint the note here rather than letting the next poll do it — on 'Off'
+  // there is no next poll, so the old cadence would be advertised forever.
+  renderMeta();
+}
+
 let autoRefreshTimer = null;
 function scheduleAutoRefresh() {
   if (autoRefreshTimer) { clearInterval(autoRefreshTimer); autoRefreshTimer = null; }
-  if (rangeIncludesToday(selectedRange)) {
-    autoRefreshTimer = setInterval(loadData, 2000);
+  // Read the stored value here (not from a module-level binding) so the
+  // top-level call at the end of this script can't trip a TDZ error.
+  const ms = readRefreshInterval();
+  if (ms > 0 && rangeIncludesToday(selectedRange)) {
+    autoRefreshTimer = setInterval(loadData, ms);
   }
 }
 
@@ -3183,6 +3251,8 @@ function initSectionNav() {
 
 initFooterMeta();
 initSectionNav();
+const refreshSel = document.getElementById('refresh-select');
+if (refreshSel) refreshSel.value = String(readRefreshInterval());
 loadData();
 scheduleAutoRefresh();
 </script>
