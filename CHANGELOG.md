@@ -6,6 +6,11 @@
 
 - Added a light/dark theme toggle (sun/moon icon button, top right of the header) with a dedicated light color set for the CSS surface variables, Chart.js chart colors, and the cost heatmap ramp. Defaults to dark and persists the choice in `localStorage`; an inline anti-flash script applies the saved theme before first paint.
 
+### Scanner
+
+- Fixed sessions showing **`unknown`** in the dashboard's Project column when Claude Code wrote the session's title record as the first line of the transcript. Title records carry a `sessionId` but no `cwd`, so they created the session's metadata with project `unknown`, and the later `cwd`-bearing records only refreshed timestamps — leaving the project name down to whether the title happened to land on line 1. The parser now backfills project name (and git branch) from the first record that has one, keeping first-value-wins so a session that `cd`s into a subdirectory mid-run still reports the project it started in.
+- Added an ongoing repair pass that clears sessions already stored as `unknown`, reading the earliest `cwd` recorded in the `turns` table. Existing databases fix themselves on the next `scan` — deliberately not gated on files having changed, since the affected transcripts are unchanged and would otherwise never be revisited.
+
 ## v1.5.5 — 2026-07-10
 
 ### Dashboard

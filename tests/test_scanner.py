@@ -11,6 +11,7 @@ from scanner import (
     get_db, init_db, project_name_from_cwd, parse_jsonl_file,
     aggregate_sessions, upsert_sessions, insert_turns, scan,
     _backfill_topics, _resync_missing_topics, _meta_get, _meta_set,
+    _repair_unknown_projects,
 )
 
 
@@ -1090,6 +1091,126 @@ class TestTopicResync(unittest.TestCase):
         self.assertEqual(after["total_input_tokens"], before["total_input_tokens"])
         self.assertEqual(after["total_output_tokens"], before["total_output_tokens"])
         self.assertEqual(after["turn_count"], before["turn_count"])
+
+
+class TestProjectNameFromTitleFirstTranscript(unittest.TestCase):
+    """A transcript opening with a title record must not pin project 'unknown'.
+
+    Title records carry a sessionId but no cwd. They used to create the session
+    meta with project_name 'unknown', and the later cwd-bearing records only
+    updated timestamps -- so whether a session got a real project name came
+    down to whether Claude Code happened to write its title as line 1.
+    """
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def _write_jsonl(self, lines):
+        path = os.path.join(self.tmpdir, "t.jsonl")
+        with open(path, "w") as f:
+            for line in lines:
+                f.write(line + "\n")
+        return path
+
+    def test_title_first_still_gets_project_name(self):
+        path = self._write_jsonl([
+            _make_ai_title_record(session_id="sess-1", title="Some Topic"),
+            _make_user_record(session_id="sess-1", cwd="/home/user/project"),
+            _make_assistant_record(session_id="sess-1", cwd="/home/user/project"),
+        ])
+        metas, _, _, _ = parse_jsonl_file(path)
+        self.assertEqual(metas[0]["project_name"], "user/project")
+        self.assertEqual(metas[0]["topic"], "Some Topic")
+
+    def test_title_first_matches_title_later(self):
+        """Title position must not change the derived project name."""
+        title = _make_ai_title_record(session_id="sess-1")
+        user = _make_user_record(session_id="sess-1", cwd="/home/user/project")
+        asst = _make_assistant_record(session_id="sess-1", cwd="/home/user/project")
+
+        first, _, _, _ = parse_jsonl_file(self._write_jsonl([title, user, asst]))
+        later, _, _, _ = parse_jsonl_file(self._write_jsonl([user, title, asst]))
+        self.assertEqual(first[0]["project_name"], later[0]["project_name"])
+
+    def test_first_cwd_wins_over_later_subdirectory(self):
+        """A session that cd's mid-run keeps the project it started in."""
+        path = self._write_jsonl([
+            _make_ai_title_record(session_id="sess-1"),
+            _make_user_record(session_id="sess-1", cwd="/home/user/project"),
+            _make_assistant_record(session_id="sess-1",
+                                   cwd="/home/user/project/node_modules/elysia"),
+        ])
+        metas, _, _, _ = parse_jsonl_file(path)
+        self.assertEqual(metas[0]["project_name"], "user/project")
+
+    def test_git_branch_also_backfilled(self):
+        path = self._write_jsonl([
+            _make_ai_title_record(session_id="sess-1"),
+            json.dumps({"type": "user", "sessionId": "sess-1",
+                        "timestamp": "2026-04-08T09:59:00Z",
+                        "cwd": "/home/user/project", "gitBranch": "main"}),
+        ])
+        metas, _, _, _ = parse_jsonl_file(path)
+        self.assertEqual(metas[0]["git_branch"], "main")
+
+
+class TestRepairUnknownProjects(unittest.TestCase):
+    """Rows written 'unknown' by an older build are repaired from turns.cwd."""
+
+    def setUp(self):
+        fd, self.db_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.conn = get_db(self.db_path)
+        init_db(self.conn)
+
+    def tearDown(self):
+        self.conn.close()
+        os.unlink(self.db_path)
+
+    def _add(self, session_id, project_name, cwds):
+        self.conn.execute(
+            "INSERT INTO sessions (session_id, project_name, first_timestamp, "
+            "last_timestamp, git_branch, total_input_tokens, total_output_tokens, "
+            "total_cache_read, total_cache_creation, model, turn_count) "
+            "VALUES (?, ?, '2026-04-08T10:00:00Z', '2026-04-08T10:00:00Z', "
+            "'', 0, 0, 0, 0, 'claude-sonnet-4-6', 0)",
+            (session_id, project_name))
+        for i, cwd in enumerate(cwds):
+            self.conn.execute(
+                "INSERT INTO turns (session_id, timestamp, model, input_tokens, "
+                "output_tokens, cache_read_tokens, cache_creation_tokens, "
+                "tool_name, cwd, message_id) "
+                "VALUES (?, ?, 'claude-sonnet-4-6', 1, 1, 0, 0, '', ?, ?)",
+                (session_id, f"2026-04-08T10:0{i}:00Z", cwd,
+                 f"{session_id}-msg-{i}"))
+        self.conn.commit()
+
+    def _project(self, session_id):
+        return self.conn.execute(
+            "SELECT project_name FROM sessions WHERE session_id = ?",
+            (session_id,)).fetchone()["project_name"]
+
+    def test_repairs_from_earliest_turn_cwd(self):
+        self._add("s1", "unknown", ["/home/user/project",
+                                    "/home/user/project/node_modules/elysia"])
+        self.assertEqual(_repair_unknown_projects(self.conn), 1)
+        self.assertEqual(self._project("s1"), "user/project")
+
+    def test_leaves_healthy_rows_alone(self):
+        self._add("s1", "user/project", ["/home/user/project/subdir/deeper"])
+        self.assertEqual(_repair_unknown_projects(self.conn), 0)
+        self.assertEqual(self._project("s1"), "user/project")
+
+    def test_leaves_row_with_no_cwd_alone(self):
+        self._add("s1", "unknown", [""])
+        self.assertEqual(_repair_unknown_projects(self.conn), 0)
+        self.assertEqual(self._project("s1"), "unknown")
+
+    def test_is_idempotent(self):
+        self._add("s1", "unknown", ["/home/user/project"])
+        _repair_unknown_projects(self.conn)
+        self.assertEqual(_repair_unknown_projects(self.conn), 0)
+        self.assertEqual(self._project("s1"), "user/project")
 
 
 if __name__ == "__main__":

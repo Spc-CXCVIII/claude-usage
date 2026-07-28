@@ -301,6 +301,88 @@ def project_name_from_cwd(cwd):
     return parts[-1] if parts else "unknown"
 
 
+def _new_session_meta(session_id, cwd="", git_branch="", timestamp=""):
+    """Build the session-metadata dict tracked while parsing a transcript.
+
+    Called with no cwd/branch for a session first seen via a title record —
+    those carry a sessionId but no cwd, so project_name starts as 'unknown'
+    and `_backfill_session_meta` fills it from the first real record.
+    """
+    return {
+        "session_id": session_id,
+        "project_name": project_name_from_cwd(cwd),
+        "first_timestamp": timestamp,
+        "last_timestamp": timestamp,
+        "git_branch": git_branch,
+        "model": None,
+        "topic": None,
+    }
+
+
+def _backfill_session_meta(meta, cwd, git_branch):
+    """Fill placeholder project/branch left behind by a session's first record.
+
+    Claude Code may write a custom-title / ai-title record as the *first* line
+    of a transcript. It carries a sessionId but no cwd or gitBranch, so the
+    meta row it creates is a placeholder — and before this backfill existed,
+    the later cwd-bearing records only updated timestamps, pinning the whole
+    session to project 'unknown'.
+
+    First real value wins: a session that `cd`s into a subdirectory (or into
+    node_modules) mid-run must keep the project it started in, so a meta that
+    already holds a real value is never overwritten.
+    """
+    if meta.get("project_name") in (None, "", "unknown"):
+        name = project_name_from_cwd(cwd)
+        if name != "unknown":
+            meta["project_name"] = name
+    if not meta.get("git_branch") and git_branch:
+        meta["git_branch"] = git_branch
+
+
+def _repair_unknown_projects(conn):
+    """Ongoing repair for sessions stored with project_name 'unknown'.
+
+    `_backfill_session_meta` fixes this while parsing, but DBs written by
+    earlier builds still hold the bad value, and `upsert_sessions`' UPDATE path
+    never rewrites project_name — so an incremental scan alone would never
+    clear it (the transcript's already-read bytes are never revisited).
+
+    Repaired from the `turns` table, which stores each turn's cwd, so this
+    costs one indexed query per affected session and never re-reads a
+    transcript. Uses the session's *earliest* recorded cwd, approximating the
+    parser's first-value-wins rule -- `turns` holds only assistant records, so
+    this can differ from the parser's first-record cwd for a session that `cd`s
+    before its first assistant turn. Sessions with no cwd anywhere (nothing to
+    infer from) are left alone. Safe to run every scan. Returns rows fixed.
+    """
+    rows = conn.execute("""
+        SELECT s.session_id, (
+            SELECT t.cwd FROM turns t
+            WHERE t.session_id = s.session_id
+              AND t.cwd IS NOT NULL AND t.cwd != ''
+            ORDER BY t.timestamp LIMIT 1
+        ) AS cwd
+        FROM sessions s
+        WHERE s.project_name IS NULL OR s.project_name = ''
+           OR s.project_name = 'unknown'
+    """).fetchall()
+
+    fixed = 0
+    for r in rows:
+        if not r["cwd"]:
+            continue
+        name = project_name_from_cwd(r["cwd"])
+        if name == "unknown":
+            continue
+        conn.execute("UPDATE sessions SET project_name = ? WHERE session_id = ?",
+                     (name, r["session_id"]))
+        fixed += 1
+    if fixed:
+        conn.commit()
+    return fixed
+
+
 def is_subagent_record(record, source_path=""):
     """True if a record belongs to a dispatched subagent (Task/Agent tool).
 
@@ -455,15 +537,7 @@ def parse_jsonl_file(filepath):
                 title = _extract_title(record)
                 if title:
                     if session_id not in session_meta:
-                        session_meta[session_id] = {
-                            "session_id": session_id,
-                            "project_name": "unknown",
-                            "first_timestamp": "",
-                            "last_timestamp": "",
-                            "git_branch": "",
-                            "model": None,
-                            "topic": None,
-                        }
+                        session_meta[session_id] = _new_session_meta(session_id)
                     meta = session_meta[session_id]
                     # custom-title always wins; ai-title only if no custom-title set
                     if rtype == "custom-title":
@@ -483,17 +557,11 @@ def parse_jsonl_file(filepath):
 
                 # Update session metadata from any record
                 if session_id not in session_meta:
-                    session_meta[session_id] = {
-                        "session_id": session_id,
-                        "project_name": project_name_from_cwd(cwd),
-                        "first_timestamp": timestamp,
-                        "last_timestamp": timestamp,
-                        "git_branch": git_branch,
-                        "model": None,
-                        "topic": None,
-                    }
+                    session_meta[session_id] = _new_session_meta(
+                        session_id, cwd, git_branch, timestamp)
                 else:
                     meta = session_meta[session_id]
+                    _backfill_session_meta(meta, cwd, git_branch)
                     if timestamp and (not meta["first_timestamp"] or timestamp < meta["first_timestamp"]):
                         meta["first_timestamp"] = timestamp
                     if timestamp and (not meta["last_timestamp"] or timestamp > meta["last_timestamp"]):
@@ -810,15 +878,7 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
                         title = _extract_title(record)
                         if title:
                             if session_id not in new_session_metas:
-                                new_session_metas[session_id] = {
-                                    "session_id": session_id,
-                                    "project_name": "unknown",
-                                    "first_timestamp": "",
-                                    "last_timestamp": "",
-                                    "git_branch": "",
-                                    "model": None,
-                                    "topic": None,
-                                }
+                                new_session_metas[session_id] = _new_session_meta(session_id)
                             meta = new_session_metas[session_id]
                             if rtype == "custom-title":
                                 meta["topic"] = title
@@ -833,20 +893,15 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
 
                         timestamp = record.get("timestamp", "")
                         cwd = record.get("cwd", "")
+                        git_branch = record.get("gitBranch", "")
 
                         # Track session metadata from new lines
                         if session_id not in new_session_metas:
-                            new_session_metas[session_id] = {
-                                "session_id": session_id,
-                                "project_name": project_name_from_cwd(cwd),
-                                "first_timestamp": timestamp,
-                                "last_timestamp": timestamp,
-                                "git_branch": record.get("gitBranch", ""),
-                                "model": None,
-                                "topic": None,
-                            }
+                            new_session_metas[session_id] = _new_session_meta(
+                                session_id, cwd, git_branch, timestamp)
                         else:
                             meta = new_session_metas[session_id]
+                            _backfill_session_meta(meta, cwd, git_branch)
                             if timestamp and (not meta["last_timestamp"] or timestamp > meta["last_timestamp"]):
                                 meta["last_timestamp"] = timestamp
                             if timestamp and (not meta["first_timestamp"] or timestamp < meta["first_timestamp"]):
@@ -937,6 +992,14 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
                 turn_count = COALESCE((SELECT COUNT(*) FROM turns WHERE turns.session_id = sessions.session_id), 0)
         """)
         conn.commit()
+
+    # Ongoing repair for sessions stuck at project 'unknown'. Deliberately not
+    # gated on new_files/updated_files: the rows this fixes were written by an
+    # older build, so the transcripts behind them are unchanged and a scan that
+    # skips every file must still clear them.
+    repaired = _repair_unknown_projects(conn)
+    if verbose and repaired:
+        print(f"Repaired project name for {repaired} session(s).")
 
     if verbose:
         print(f"\nScan complete:")
