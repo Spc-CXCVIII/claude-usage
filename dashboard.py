@@ -401,6 +401,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     --blue: #48A0C7;
     --green: #74C991;
     --red: #C74E39;
+    --green-rgb: 116,201,145;  /* rgb triplet of --green, for lighter/faded tints */
+    --red-rgb: 199,78,57;      /* rgb triplet of --red, for lighter/faded tints */
     --raised: #2E2F31;  /* hover / raised surfaces — top of the elevation ladder */
     --selected: #262626;  /* selected chips / tabs (neutral, not accent) */
     --hm-empty: #242526;      /* heatmap cell with no usage */
@@ -428,6 +430,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     --blue: #256F8C;
     --green: #257A4E;
     --red: #A83324;
+    --green-rgb: 37,122,78;
+    --red-rgb: 168,51,36;
     --raised: #F0EBE1;
     --selected: #E9E2D4;
     --hm-empty: #EAE3D7;
@@ -522,6 +526,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .date-input:hover, .date-input:focus { border-color: var(--accent); outline: none; }
   .date-input::-webkit-calendar-picker-indicator { cursor: pointer; opacity: 0.6; }
   .cycle-tag { display: inline-block; margin-left: 8px; padding: 1px 7px; border-radius: var(--radius-sm); font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; background: rgba(217,119,87,0.15); color: var(--accent); border: 1px solid rgba(217,119,87,0.35); }
+  tr.cycle-row { cursor: pointer; }
+  .row-caret { display: inline-block; width: 0.9em; margin-right: 7px; font-size: 11px; line-height: 1; color: var(--muted); transform: rotate(0deg); transition: transform 0.15s; }
+  .row-caret.open { transform: rotate(90deg); }
+  tr.cycle-week-row td { background: var(--raised); font-size: 12px; color: var(--muted); }
+  tr.cycle-week-row td.cost { color: rgba(var(--green-rgb), 0.7); }
+  tr.cycle-week-row td.delta-up { color: rgba(var(--red-rgb), 0.7); }
+  tr.cycle-week-row td.delta-down { color: rgba(var(--green-rgb), 0.7); }
+  tr.cycle-week-row .week-cell { padding-left: 30px; }
+  tr.cycle-week-row:hover td { background: var(--selected); }
   .delta-up { color: var(--red); }
   .delta-down { color: var(--green); }
 
@@ -789,7 +802,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   </div>
   <div class="stats-row today-row" id="stats-row-today" style="display:none"></div>
   <div class="table-card" id="sec-billing" data-card="billing-cycles">
-    <div class="section-header"><div class="section-title"><span class="card-caret">&#9656;</span>Billing Cycles <span class="info-icon" tabindex="0" role="img" aria-label="About this table" title="One row per subscription month, anchored on the Sub Start day — e.g. a June 22 start bills the 22nd of each month through the 21st of the next. Respects the model filter; ignores the date-range filter."><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg></span></div><button class="export-btn" onclick="exportCyclesCSV()" title="Export all billing cycles to CSV">&#x2913; CSV</button></div>
+    <div class="section-header"><div class="section-title"><span class="card-caret">&#9656;</span>Billing Cycles <span class="info-icon" tabindex="0" role="img" aria-label="About this table" title="One row per subscription month, anchored on the Sub Start day — e.g. a June 22 start bills the 22nd of each month through the 21st of the next. Respects the model filter; ignores the date-range filter. Click a cycle row to expand its weekly breakdown — the weekly usage limit resets Saturdays at 01:00, so weeks run Saturday through Friday."><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg></span></div><button class="export-btn" onclick="exportCyclesCSV()" title="Export all billing cycles to CSV">&#x2913; CSV</button></div>
     <table>
       <thead><tr>
         <th>Cycle</th><th>Days</th><th>Turns</th><th>Input</th><th>Output</th>
@@ -982,6 +995,8 @@ let sessionSortDir = 'desc';
 // settings block (persisted server-side in the DB), saved via POST /api/settings.
 let subscriptionStart = null;
 let lastCycles = [];
+// Cycle rows expanded to show their weekly sub-table (keyed by cycle.start).
+const expandedCycles = new Set();
 
 // Tables reveal rows in steps: 10 -> 25 -> 50, capped at 50 because rendering
 // more than that visibly hurts performance. Past 50 the footer offers a
@@ -1380,6 +1395,71 @@ function listSubCycles(subISO) {
 
 function cycleDayCount(c) {
   return Math.round((parseISODate(c.end) - parseISODate(c.start)) / 86400000) + 1;
+}
+
+// ── Weekly sub-breakdown within a billing cycle ─────────────────────────────
+// Anthropic's weekly usage limit resets Saturdays at 01:00, so weeks run
+// Saturday -> Friday. Our usage data is day-granular (no time-of-day), which
+// can't represent the 01:00 cutoff exactly, but on a whole-day basis that's
+// indistinguishable from a plain Saturday boundary, so we treat Saturday as
+// the first day of the week.
+function saturdayOnOrBefore(date) {
+  const day = date.getDay();  // Sun=0 … Sat=6
+  const diff = (day + 1) % 7;  // days back to the most recent Saturday
+  const d = new Date(date);
+  d.setDate(date.getDate() - diff);
+  return d;
+}
+
+// Every Sat->Fri week overlapping the cycle, clipped to the cycle's bounds.
+function listCycleWeeks(cycle) {
+  const cycleStart = parseISODate(cycle.start), cycleEnd = parseISODate(cycle.end);
+  const todayISO = localISODate(new Date());
+  const weeks = [];
+  let cur = saturdayOnOrBefore(cycleStart);
+  while (cur <= cycleEnd) {
+    const weekEnd = new Date(cur); weekEnd.setDate(cur.getDate() + 6);
+    const start = cur < cycleStart ? cycleStart : cur;
+    const end = weekEnd > cycleEnd ? cycleEnd : weekEnd;
+    const startISO = localISODate(start), endISO = localISODate(end);
+    weeks.push({
+      start: startISO, end: endISO,
+      current: startISO <= todayISO && todayISO <= endISO,
+      turns: 0, input: 0, output: 0, cache_read: 0, cache_creation: 0, cost: 0,
+    });
+    cur.setDate(cur.getDate() + 7);
+  }
+  return weeks;
+}
+
+function computeCycleWeeks(cycle) {
+  if (!rawData) return [];
+  const weeks = listCycleWeeks(cycle);
+  if (!weeks.length) return weeks;
+  for (const r of rawData.daily_by_model) {
+    if (!selectedModels.has(r.model)) continue;
+    if (r.day < weeks[0].start || r.day > weeks[weeks.length - 1].end) continue;
+    const w = weeks.find(w => r.day >= w.start && r.day <= w.end);
+    if (!w) continue;
+    w.turns          += r.turns;
+    w.input          += r.input;
+    w.output         += r.output;
+    w.cache_read     += r.cache_read;
+    w.cache_creation += r.cache_creation;
+    w.cost           += calcCost(r.model, r.input, r.output, r.cache_read, r.cache_creation, r.day);
+  }
+  for (let i = 1; i < weeks.length; i++) {
+    weeks[i].costDelta = weeks[i - 1].cost > 0
+      ? (weeks[i].cost - weeks[i - 1].cost) / weeks[i - 1].cost
+      : null;
+  }
+  return weeks;
+}
+
+function toggleCycleRow(start) {
+  if (expandedCycles.has(start)) expandedCycles.delete(start);
+  else expandedCycles.add(start);
+  renderBillingCycles(lastCycles);
 }
 
 function getRangeBounds(range) {
@@ -1925,12 +2005,43 @@ function computeBillingCycles() {
   return cycles.reverse();  // newest first
 }
 
-function deltaCellHTML(delta, partial) {
+function deltaCellHTML(delta, partial, noun) {
   if (delta == null) return '<td class="muted">—</td>';
   const up = delta >= 0;
   const cls = up ? 'delta-up' : 'delta-down';
-  const title = partial ? ' title="Current cycle is still in progress — compares a partial cycle against the full previous one"' : '';
+  const title = partial ? ` title="Current ${noun || 'cycle'} is still in progress — compares a partial ${noun || 'cycle'} against the full previous one"` : '';
   return `<td class="num ${cls}"${title}>${up ? '▲' : '▼'} ${Math.abs(delta * 100).toFixed(2)}%${partial ? '<span class="muted">*</span>' : ''}</td>`;
+}
+
+function cycleRowHTML(c) {
+  const k = 'cy|' + c.start + '|';
+  const open = expandedCycles.has(c.start);
+  return `<tr class="cycle-row" onclick="toggleCycleRow('${c.start}')">
+    <td class="num"><span class="row-caret${open ? ' open' : ''}" title="Click to see the weekly breakdown — the weekly usage limit resets Saturdays at 01:00">&#9656;</span>${esc(c.start)} → ${esc(c.end)}${c.current ? '<span class="cycle-tag">current</span>' : ''}</td>
+    <td class="muted">${cycleDayCount(c)}</td>
+    <td class="num">${animNum(k + 'turns', c.turns, 'int')}</td>
+    <td class="num">${animNum(k + 'input', c.input, 'tok')}</td>
+    <td class="num">${animNum(k + 'output', c.output, 'tok')}</td>
+    <td class="num">${animNum(k + 'cr', c.cache_read, 'tok')}</td>
+    <td class="num">${animNum(k + 'cc', c.cache_creation, 'tok')}</td>
+    <td class="cost">${animNum(k + 'cost', c.cost, 'cost')}</td>
+    ${deltaCellHTML(c.costDelta, c.current, 'cycle')}
+  </tr>`;
+}
+
+function weekRowHTML(cycleStart, w) {
+  const k = 'wk|' + cycleStart + '|' + w.start + '|';
+  return `<tr class="cycle-week-row">
+    <td class="num week-cell">${esc(w.start)} → ${esc(w.end)}${w.current ? '<span class="cycle-tag">current</span>' : ''}</td>
+    <td class="muted">${cycleDayCount(w)}</td>
+    <td class="num">${animNum(k + 'turns', w.turns, 'int')}</td>
+    <td class="num">${animNum(k + 'input', w.input, 'tok')}</td>
+    <td class="num">${animNum(k + 'output', w.output, 'tok')}</td>
+    <td class="num">${animNum(k + 'cr', w.cache_read, 'tok')}</td>
+    <td class="num">${animNum(k + 'cc', w.cache_creation, 'tok')}</td>
+    <td class="cost">${animNum(k + 'cost', w.cost, 'cost')}</td>
+    ${deltaCellHTML(w.costDelta, w.current, 'week')}
+  </tr>`;
 }
 
 function renderBillingCycles(rows) {
@@ -1947,18 +2058,9 @@ function renderBillingCycles(rows) {
   }
   const shown = rows.slice(0, shownCount(cyclesLimit, rows.length));
   body.innerHTML = shown.map(c => {
-    const k = 'cy|' + c.start + '|';
-    return `<tr>
-      <td class="num">${esc(c.start)} → ${esc(c.end)}${c.current ? '<span class="cycle-tag">current</span>' : ''}</td>
-      <td class="muted">${cycleDayCount(c)}</td>
-      <td class="num">${animNum(k + 'turns', c.turns, 'int')}</td>
-      <td class="num">${animNum(k + 'input', c.input, 'tok')}</td>
-      <td class="num">${animNum(k + 'output', c.output, 'tok')}</td>
-      <td class="num">${animNum(k + 'cr', c.cache_read, 'tok')}</td>
-      <td class="num">${animNum(k + 'cc', c.cache_creation, 'tok')}</td>
-      <td class="cost">${animNum(k + 'cost', c.cost, 'cost')}</td>
-      ${deltaCellHTML(c.costDelta, c.current)}
-    </tr>`;
+    if (!expandedCycles.has(c.start)) return cycleRowHTML(c);
+    const weeks = computeCycleWeeks(c);
+    return cycleRowHTML(c) + weeks.map(w => weekRowHTML(c.start, w)).join('');
   }).join('');
   runCellAnims('billing-body');
   renderTableToggle('billing-foot', rows.length, cyclesLimit, 'lessCycleRows', 'moreCycleRows', 'exportCyclesCSV');
